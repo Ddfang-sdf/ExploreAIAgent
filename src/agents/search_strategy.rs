@@ -51,7 +51,7 @@ impl SearchStrategyAgent {
         config: &ExplorationConfig,
     ) -> Self {
         SearchStrategyAgent {
-            max_rounds: config.max_fast_explore_rounds,
+            max_rounds: 3, // v1.2: SSA deprecated, fast_explore uses single-shot execution
             _adapter: adapter,
             _tool_registry: tool_registry,
         }

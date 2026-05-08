@@ -88,11 +88,19 @@ impl LlmStructuredClient for ApiAdapter {
         loop {
             let raw_response = match self.api_mode {
                 ApiMode::Chat => {
-                    let prompt = format!(
-                        "{}\n\n{}",
-                        instructions,
-                        serde_json::to_string(input_data).unwrap_or_default()
-                    );
+                    let prompt = if instructions.to_lowercase().contains("json") {
+                        format!(
+                            "{}\n\n{}",
+                            instructions,
+                            serde_json::to_string(input_data).unwrap_or_default()
+                        )
+                    } else {
+                        format!(
+                            "{}\n\n请以 JSON 格式回复。\n{}",
+                            instructions,
+                            serde_json::to_string(input_data).unwrap_or_default()
+                        )
+                    };
                     let messages = vec![serde_json::json!({
                         "role": "system",
                         "content": prompt

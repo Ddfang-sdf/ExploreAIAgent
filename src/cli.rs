@@ -70,11 +70,15 @@ pub async fn run_cli_with_io<R: BufRead, W: Write>(
             break;
         }
 
-        match core.orchestrator.run(&input, &mut ect).await {
+        let t0 = std::time::Instant::now();
+        match core.orchestrator.run(&input, &ect).await {
             Ok(answer) => {
+                let elapsed = t0.elapsed().as_secs_f64();
+                eprintln!("\r\x1b[K✅ 回答完成 ({:.1}s)", elapsed);
                 writeln!(writer, "{}", answer).map_err(|e| e.to_string())?;
             }
             Err(e) => {
+                eprintln!("\r\x1b[K❌ 出错");
                 writeln!(writer, "[ERROR] {}", e).map_err(|e| e.to_string())?;
             }
         }

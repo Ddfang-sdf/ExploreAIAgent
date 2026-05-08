@@ -6,3 +6,4 @@ pub mod search_content;
 pub mod list_dir;
 pub mod file_info;
 pub mod execute_shell;
+pub mod fast_explore_tool;

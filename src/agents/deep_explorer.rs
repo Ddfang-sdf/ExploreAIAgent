@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::adapter::api_adapter::LlmToolClient;
 use crate::agents::exploration_refiner::ExplorationRefinerAgent;
+use crate::agents::quality_evaluator::ExplorationQualityEvaluator;
 use crate::common::config::DeepExplorerConfig;
 use crate::context::exploration::{ExplorationContextTool, ExplorationSummary};
 use crate::tools::registry::ToolRegistry;
@@ -274,7 +275,7 @@ impl DeepExplorer {
                 .map(|m| serde_json::to_string(m).unwrap_or_default().len())
                 .sum();
             if total_chars / 4 > MAX_CONTEXT_TOKENS {
-                eprintln!("[INFO] DE context overflow ({} tokens), triggering refinement", total_chars / 4);
+                eprintln!("\r\x1b[K  🗜️ 上下文过大，正在压缩...");
 
                 // Step 1: Read data from ECT
                 let ect_summary = ect
@@ -313,7 +314,7 @@ impl DeepExplorer {
                     Ok(new_summary) => {
                         // Step 4: Write refined summary back to ECT
                         if let Err(e) = ect.update_summary(new_summary) {
-                            eprintln!("[WARN] DE refinement: update_summary failed: {}", e);
+                            eprintln!("\r\x1b[K  ⚠️ 上下文压缩失败");
                         }
 
                         // Step 5: Rebuild messages from ECT
@@ -357,26 +358,21 @@ impl DeepExplorer {
 
                         degradation_count = 0;
                         parse_retries = 0;
-                        eprintln!(
-                            "[INFO] DE refinement done: {} → {} chars (summary + last 2 records)",
-                            total_chars,
-                            messages.iter()
-                                .map(|m| serde_json::to_string(m).unwrap_or_default().len())
-                                .sum::<usize>()
-                        );
+                        let new_chars: usize = messages.iter()
+                            .map(|m| serde_json::to_string(m).unwrap_or_default().len())
+                            .sum();
+                        eprintln!("\r\x1b[K  📦 压缩完成（{} → {} 字符）", total_chars, new_chars);
                     }
                     Err(refine_err) => {
                         // Section 6.5 Step 5: Degradation
                         degradation_count += 1;
                         eprintln!(
-                            "[WARN] DE refinement failed (degradation {}/{}): {}",
-                            degradation_count, MAX_DEGRADATION, refine_err
+                            "\r\x1b[K  ⚠️ 压缩失败 ({}/{})，截断继续",
+                            degradation_count, MAX_DEGRADATION
                         );
 
                         if degradation_count >= MAX_DEGRADATION {
-                            eprintln!(
-                                "[WARN] DE degradation limit reached, terminating exploration"
-                            );
+                            eprintln!("\r\x1b[K  ⚠️ 压缩连续失败，终止探索");
                             return Ok(DeepExplorerResult {
                                 critical_files: vec![],
                                 collected_evidence: vec![],
@@ -451,7 +447,7 @@ impl DeepExplorer {
             let json_text = match extract_json_object(&text) {
                 Some(j) => j,
                 None => {
-                    eprintln!("[WARN] DE response has no JSON (retry {}/{})", parse_retries + 1, MAX_PARSE_RETRIES);
+                    // JSON parse retry — internal, not user-facing
                     if parse_retries < MAX_PARSE_RETRIES {
                         messages.push(serde_json::json!({
                             "role": "user",
@@ -470,7 +466,7 @@ impl DeepExplorer {
                     Some(Ok(v)) => v,
                     Some(Err(e)) => {
                         if !parsed_any && parse_retries < MAX_PARSE_RETRIES {
-                            eprintln!("[WARN] DE JSON parse error (retry {}/{}): {}", parse_retries + 1, MAX_PARSE_RETRIES, e);
+                            // JSON parse retry — internal, not user-facing
                             messages.push(serde_json::json!({
                                 "role": "user",
                                 "content": format!("你的回复不是合法 JSON。请严格按照格式输出。错误: {}", e),
@@ -489,7 +485,11 @@ impl DeepExplorer {
                     .get("action")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                eprintln!("  深度探索 #{}{}", tool_call_count + 1, if action == "done" { " — 完成" } else { "" });
+                if action == "done" {
+                    eprintln!("\r\x1b[K  深度探索完成，共 {} 轮", tool_call_count + 1);
+                } else {
+                    eprint!("\r\x1b[K  深度探索轮次 {}", tool_call_count + 1);
+                }
 
                 match action {
                     "tool_call" => {
@@ -521,21 +521,35 @@ impl DeepExplorer {
                                 })
                         };
 
-                        // Auto-record to ECT
-                        let _ = tool_registry.execute(
-                            "exploration_context_tool",
-                            serde_json::json!({
-                                "action": "write",
-                                "data": {
-                                    "type": "tool_call",
-                                    "source": "DeepExplorer",
-                                    "tool": &tool_name,
-                                    "params": &params,
-                                    "result_summary": serde_json::to_string(&tool_result).unwrap_or_default(),
-                                    "confidence": 0.5,
-                                }
-                            }),
+                        // Auto-record to ECT (use parameter ect, not registry's internal ECT)
+                        let _ = ect.write_record(
+                            crate::context::exploration::ExplorationRecord::ToolCall {
+                                source: "DeepExplorer".to_string(),
+                                tool: tool_name.clone(),
+                                params: params.clone(),
+                                result_summary: serde_json::to_string(&tool_result).unwrap_or_default(),
+                                confidence: 0.5,
+                                timestamp: chrono::Utc::now(),
+                            },
                         );
+
+                        // v1.2: QE scoring per tool call (before result goes back to LLM)
+                        let qe = ExplorationQualityEvaluator::new();
+                        if let Ok(qe_summary) = qe.evaluate(question, &tool_result, adapter).await {
+                            let _ = ect.write_record(
+                                crate::context::exploration::ExplorationRecord::Summary {
+                                    source: "ExplorationQualityEvaluator".to_string(),
+                                    data: crate::context::exploration::ExplorationSummary {
+                                        key_findings: qe_summary.key_findings,
+                                        critical_files: vec![],
+                                        missing_info: qe_summary.missing_info,
+                                        confidence: qe_summary.confidence,
+                                    },
+                                    confidence: qe_summary.confidence,
+                                    timestamp: chrono::Utc::now(),
+                                },
+                            );
+                        }
 
                         let reasoning = action_json
                             .get("reasoning")

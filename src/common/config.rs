@@ -17,9 +17,6 @@ fn default_thinking() -> bool { false }
 fn default_token_threshold() -> usize { 12000 }
 fn default_token_target_ratio() -> f64 { 0.40 }
 fn default_refiner_summary_ratio() -> f64 { 0.10 }
-fn default_max_rounds() -> usize { 5 }
-fn default_early_termination_confidence() -> f64 { 0.9 }
-
 fn default_max_tool_calls() -> usize { 75 }
 fn default_loop_warning_threshold() -> usize { 3 }
 
@@ -114,12 +111,6 @@ pub struct ExplorationConfig {
 
     #[serde(default = "default_refiner_summary_ratio")]
     pub refiner_summary_token_ratio: f64,
-
-    #[serde(default = "default_max_rounds")]
-    pub max_fast_explore_rounds: usize,
-
-    #[serde(default = "default_early_termination_confidence")]
-    pub early_termination_confidence: f64,
 }
 
 impl Default for ExplorationConfig {
@@ -128,8 +119,6 @@ impl Default for ExplorationConfig {
             token_threshold: default_token_threshold(),
             token_target_ratio: default_token_target_ratio(),
             refiner_summary_token_ratio: default_refiner_summary_ratio(),
-            max_fast_explore_rounds: default_max_rounds(),
-            early_termination_confidence: default_early_termination_confidence(),
         }
     }
 }

@@ -1,4 +1,4 @@
-use explore_ai_agent::common::config::*;
+﻿use explore_ai_agent::common::config::*;
 use std::fs;
 use std::sync::Mutex;
 use tempfile::TempDir;
@@ -51,8 +51,6 @@ exploration:
   token_threshold: 15000
   token_target_ratio: 0.35
   refiner_summary_token_ratio: 0.08
-  max_fast_explore_rounds: 7
-  early_termination_confidence: 0.85
 
 deep_explorer:
   max_tool_calls: 50
@@ -235,8 +233,7 @@ fn cf_013_all_defaults_from_empty_json() {
     // Exploration
     assert_eq!(config.exploration.token_threshold, 12000);
     assert!((config.exploration.token_target_ratio - 0.40).abs() < f64::EPSILON);
-    assert_eq!(config.exploration.max_fast_explore_rounds, 5);
-    assert!((config.exploration.early_termination_confidence - 0.9).abs() < f64::EPSILON);
+    // v1.2: max_fast_explore_rounds and early_termination_confidence removed
 
     // Deep Explorer
     assert_eq!(config.deep_explorer.max_tool_calls, 75);
@@ -280,6 +277,61 @@ fn cf_014_partial_override() {
 
     // 其余仍是默认值
     assert_eq!(config.llm.model, "deepseek-chat");
-    assert_eq!(config.exploration.max_fast_explore_rounds, 5);
     assert_eq!(config.tools.shell_timeout_secs, 30);
+}
+
+// ============================================================================
+// v1.2: 配置清理测试 (CF-013 ~ CF-015)
+// ============================================================================
+
+// CF-013: 旧 SSA 配置项被忽略（v1.2 已从结构体中移除这些字段）
+// 推导链：YAML 含已删除字段 → serde 默认忽略未知字段 → 加载成功不报错
+#[test]
+fn cf_013_legacy_ssa_config_ignored() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = r#"
+llm:
+  api_key: sk-test
+exploration:
+  token_threshold: 6000
+  enable_fast_explore: false
+"#;
+    let path = write_config(&dir, yaml);
+    let result = AppConfig::load(Some(&path));
+    // v1.2: 旧字段不再存在于结构体中，serde 默认跳过未知字段，不报错
+    assert!(result.is_ok(), "含已废弃字段的配置应正常加载，实际: {:?}", result.err());
+}
+
+// CF-014: 精简后的 exploration 配置加载
+// 推导链：YAML 仅含 exploration.token_threshold 和 token_target_ratio → 加载成功
+#[test]
+fn cf_014_minimal_exploration_config_loads() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = r#"
+llm:
+  api_key: sk-test
+exploration:
+  token_threshold: 8000
+  token_target_ratio: 0.50
+"#;
+    let path = write_config(&dir, yaml);
+    let config = AppConfig::load(Some(&path)).expect("精简配置应加载成功");
+    // token_threshold 和 token_target_ratio 从 YAML 读取
+    assert_eq!(config.exploration.token_threshold, 8000);
+    assert!((config.exploration.token_target_ratio - 0.50).abs() < 0.001);
+}
+
+// CF-015: exploration 段不存在
+// 推导链：YAML 不含 exploration 段 → 所有 exploration 字段使用默认值 → 不 panic
+#[test]
+fn cf_015_no_exploration_section_uses_defaults() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(&dir, "llm:\n  api_key: sk-test\n");
+    let config = AppConfig::load(Some(&path)).expect("无 exploration 段应正常加载");
+    // 使用默认值
+    assert!(config.exploration.token_threshold > 0, "token_threshold 应有默认值");
+    assert!(config.exploration.token_target_ratio > 0.0, "token_target_ratio 应有默认值");
 }

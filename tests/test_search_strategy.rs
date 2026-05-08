@@ -1,3 +1,6 @@
+// ⚠️ v1.2: SearchStrategyAgent 已废弃。本测试文件保留作为历史参考。
+// 相关逻辑已迁移至：MainAgent（关键词设计）+ fast_explore_tool（代码执行）+ QE（评分）。
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 

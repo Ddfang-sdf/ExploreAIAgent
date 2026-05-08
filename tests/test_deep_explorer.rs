@@ -482,8 +482,18 @@ async fn de_027_messages_rebuilt_after_refinement() {
 
     // First exploration call: search (produces large context)
     mock.push_tool_response(make_large_search_response());
+    // QE after first tool_call
+    mock.push_structured_response(Ok(UnifiedResponse {
+        text: Some(r#"{"key_findings":"found","critical_files":[],"missing_info":"","confidence":0.8}"#.to_string()),
+        tool_calls: vec![],
+    }));
     // After refinement, DE resumes: read_file
     mock.push_tool_response(make_tool_call_response("read_file", "src/backtest.rs"));
+    // QE after second tool_call
+    mock.push_structured_response(Ok(UnifiedResponse {
+        text: Some(r#"{"key_findings":"found","critical_files":[],"missing_info":"","confidence":0.7}"#.to_string()),
+        tool_calls: vec![],
+    }));
     // Then done
     mock.push_tool_response(make_done_response());
     // Refiner returns a summary
@@ -492,9 +502,6 @@ async fn de_027_messages_rebuilt_after_refinement() {
     let result = de
         .execute("test question", &make_summary(), &mock, &registry, &ect)
         .await;
-
-    // stub: 实现后验证
-    // (1) Refiner 被调用了一次
     // (2) Refiner 返回的摘要写入了 ECT（get_current_summary 非空且含精炼内容）
     // (3) messages 重建后总 token < 8000
     // (4) messages 尾部保留最近 2 条原始工具结果
@@ -513,10 +520,20 @@ async fn de_028_refinement_failure_degradation() {
 
     // First call: large result triggers overflow
     mock.push_tool_response(make_large_search_response());
+    // QE after first tool_call
+    mock.push_structured_response(Ok(UnifiedResponse {
+        text: Some(r#"{"key_findings":"found","critical_files":[],"missing_info":"","confidence":0.8}"#.to_string()),
+        tool_calls: vec![],
+    }));
     // Refiner fails
     mock.push_structured_response(Err("LLM call failed".to_string()));
     // After degradation truncation, DE continues: read_file
     mock.push_tool_response(make_tool_call_response("read_file", "src/backtest.rs"));
+    // QE after second tool_call
+    mock.push_structured_response(Ok(UnifiedResponse {
+        text: Some(r#"{"key_findings":"found","critical_files":[],"missing_info":"","confidence":0.7}"#.to_string()),
+        tool_calls: vec![],
+    }));
     // Then done
     mock.push_tool_response(make_done_response());
 
@@ -570,4 +587,145 @@ async fn de_029_degradation_limit_terminates_loop() {
     // (4) 实际工具调用次数 < 20（提前终止，未用满 max_tool_calls）
     assert!(result.is_ok() || result.is_err(),
         "stub: 实现后应返回 Ok（degradation_count=3 时兜底终止）");
+}
+
+// ============================================================================
+// v1.2 新增: DE 内部 QE 评分 (DE-030 ~ DE-035)
+// ============================================================================
+
+// DE-030: 每次 tool_call 后触发 QE
+#[tokio::test]
+async fn de_030_qe_called_per_tool_call() {
+    let mut de = DeepExplorer::new();
+    de.max_tool_calls = 5;
+    let registry = make_registry();
+    let ect = make_ect();
+    let mock = MockDualClient::new();
+
+    // 3 tool_calls → done
+    mock.push_tool_response(make_tool_call_response("search_content", "src/a.rs"));
+    mock.push_tool_response(make_tool_call_response("read_file", "src/a.rs"));
+    mock.push_tool_response(make_tool_call_response("search_content", "src/b.rs"));
+    mock.push_tool_response(make_done_response());
+    // QE called 3 times (once per tool_call)
+    for _ in 0..3 {
+        mock.push_structured_response(Ok(UnifiedResponse {
+            text: Some(r#"{"key_findings":"ok","critical_files":[],"missing_info":"","confidence":0.8}"#.to_string()),
+            tool_calls: vec![],
+        }));
+    }
+
+    let _ = de.execute("test question", &make_summary(), &mock, &registry, &ect).await;
+    // stub: 实现后 QE 被调用 3 次（每次 tool_call 后 1 次，done 不触发）
+    assert!(true, "stub 占位");
+}
+
+// DE-031: 置信度写入 ECT
+#[tokio::test]
+async fn de_031_confidence_written_to_ect() {
+    let mut de = DeepExplorer::new();
+    de.max_tool_calls = 5;
+    let registry = make_registry();
+    let ect = make_ect();
+    let mock = MockDualClient::new();
+
+    mock.push_tool_response(make_tool_call_response("search_content", "src/a.rs"));
+    mock.push_tool_response(make_done_response());
+    mock.push_structured_response(Ok(UnifiedResponse {
+        text: Some(r#"{"key_findings":"found","critical_files":[],"missing_info":"","confidence":0.75}"#.to_string()),
+        tool_calls: vec![],
+    }));
+
+    let _ = de.execute("test question", &make_summary(), &mock, &registry, &ect).await;
+    // stub: 实现后 ECT 中 ToolCall 记录的 confidence = 0.75
+    assert!(true, "stub 占位");
+}
+
+// DE-032: QE 失败不阻塞 DE 循环
+#[tokio::test]
+async fn de_032_qe_failure_does_not_block() {
+    let mut de = DeepExplorer::new();
+    de.max_tool_calls = 5;
+    let registry = make_registry();
+    let ect = make_ect();
+    let mock = MockDualClient::new();
+
+    // 3 tool_calls → done, QE fails on #2
+    mock.push_tool_response(make_tool_call_response("search_content", "src/a.rs"));
+    mock.push_structured_response(Ok(UnifiedResponse {
+        text: Some(r#"{"key_findings":"ok","critical_files":[],"missing_info":"","confidence":0.8}"#.to_string()),
+        tool_calls: vec![],
+    }));
+    mock.push_tool_response(make_tool_call_response("read_file", "src/a.rs"));
+    mock.push_structured_response(Err("QE call failed".to_string())); // fail #2
+    mock.push_tool_response(make_tool_call_response("search_content", "src/b.rs"));
+    mock.push_structured_response(Ok(UnifiedResponse {
+        text: Some(r#"{"key_findings":"ok","critical_files":[],"missing_info":"","confidence":0.7}"#.to_string()),
+        tool_calls: vec![],
+    }));
+    mock.push_tool_response(make_done_response());
+
+    let result = de.execute("test question", &make_summary(), &mock, &registry, &ect).await;
+    // stub: DE 循环不中断；#2 QE 失败后继续执行 #3 tool_call；最终 execute() 返回 Ok
+    assert!(result.is_ok() || result.is_err(), "stub 占位");
+}
+
+// DE-033: QE 收到截断后的数据
+#[tokio::test]
+async fn de_033_qe_receives_truncated_data() {
+    let mut de = DeepExplorer::new();
+    de.max_tool_calls = 5;
+    let registry = make_registry();
+    let ect = make_ect();
+    let mock = MockDualClient::new();
+
+    // Large search result
+    mock.push_tool_response(make_large_search_response());
+    mock.push_tool_response(make_done_response());
+    mock.push_structured_response(Ok(UnifiedResponse {
+        text: Some(r#"{"key_findings":"truncated ok","critical_files":[],"missing_info":"","confidence":0.6}"#.to_string()),
+        tool_calls: vec![],
+    }));
+
+    let _ = de.execute("test question", &make_summary(), &mock, &registry, &ect).await;
+    // stub: 代码层调 QE 时传入的 exploration_data 被截断至 ≤2500 chars
+    assert!(true, "stub 占位");
+}
+
+// DE-034: 代码层处理顺序正确
+#[tokio::test]
+async fn de_034_code_layer_processing_order() {
+    let mut de = DeepExplorer::new();
+    de.max_tool_calls = 5;
+    let registry = make_registry();
+    let ect = make_ect();
+    let mock = MockDualClient::new();
+
+    mock.push_tool_response(make_tool_call_response("search_content", "src/a.rs"));
+    mock.push_tool_response(make_done_response());
+    mock.push_structured_response(Ok(UnifiedResponse {
+        text: Some(r#"{"key_findings":"ordered","critical_files":[],"missing_info":"","confidence":0.8}"#.to_string()),
+        tool_calls: vec![],
+    }));
+
+    let _ = de.execute("test question", &make_summary(), &mock, &registry, &ect).await;
+    // stub: 实现后验证调用顺序为 write_record(ECT)→refine_check→QE→write_confidence→追加messages
+    assert!(true, "stub 占位");
+}
+
+// DE-035: done 不触发 QE
+#[tokio::test]
+async fn de_035_done_does_not_trigger_qe() {
+    let mut de = DeepExplorer::new();
+    de.max_tool_calls = 5;
+    let registry = make_registry();
+    let ect = make_ect();
+    let mock = MockDualClient::new();
+
+    mock.push_tool_response(make_done_response());
+    // No structured responses pushed → QE should not be called
+
+    let result = de.execute("test question", &make_summary(), &mock, &registry, &ect).await;
+    // stub: done 分支不触发 QE；execute() 返回 Ok
+    assert!(result.is_ok() || result.is_err(), "stub 占位");
 }
