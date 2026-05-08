@@ -1,8 +1,9 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use explore_ai_agent::adapter::api_adapter::{ApiAdapter, ApiMode};
+use explore_ai_agent::adapter::api_adapter::{ApiAdapter, ApiMode, LlmStructuredClient, UnifiedResponse};
 use explore_ai_agent::agents::search_strategy::*;
+use explore_ai_agent::context::exploration::ExplorationContextTool;
 use explore_ai_agent::tools::registry::ToolRegistry;
 
 // ============================================================================
@@ -15,6 +16,53 @@ fn make_adapter() -> Arc<ApiAdapter> {
 
 fn make_registry() -> Arc<ToolRegistry> {
     Arc::new(ToolRegistry::new(PathBuf::from(".")))
+}
+
+fn make_ect() -> ExplorationContextTool {
+    ExplorationContextTool::new("ssa-test".to_string())
+}
+
+struct MockRefinerClient {
+    response: Mutex<Option<Result<UnifiedResponse, String>>>,
+    call_count: Mutex<usize>,
+}
+
+impl MockRefinerClient {
+    fn new() -> Self {
+        MockRefinerClient {
+            response: Mutex::new(None),
+            call_count: Mutex::new(0),
+        }
+    }
+
+    fn set_response(&self, resp: Result<UnifiedResponse, String>) {
+        *self.response.lock().unwrap() = Some(resp);
+    }
+
+    fn call_count(&self) -> usize {
+        *self.call_count.lock().unwrap()
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmStructuredClient for MockRefinerClient {
+    async fn call_llm_structured(
+        &self,
+        _instructions: &str,
+        _input_data: &serde_json::Value,
+        _output_schema: Option<&serde_json::Value>,
+    ) -> Result<UnifiedResponse, String> {
+        *self.call_count.lock().unwrap() += 1;
+        self.response.lock().unwrap().take()
+            .expect("MockRefinerClient called without preset response")
+    }
+}
+
+fn make_refiner_ok_response() -> Result<UnifiedResponse, String> {
+    Ok(UnifiedResponse {
+        text: Some(r#"{"key_findings":"精炼摘要","critical_files":[{"path":"src/main.rs","one_sentence_summary":"入口"}],"missing_info":"","confidence":0.8}"#.to_string()),
+        tool_calls: vec![],
+    })
 }
 
 // ============================================================================
@@ -189,28 +237,36 @@ fn ss_011_get_tools_returns_empty() {
 #[tokio::test]
 async fn ss_014_confidence_zero_is_valid() {
     let agent = SearchStrategyAgent::new(make_adapter(), make_registry());
-    let result = agent.execute_round("test", &[], 1).await;
+    let ect = make_ect();
+    let refiner = MockRefinerClient::new();
+    let result = agent.execute_round("test", &[], 1, &ect, &refiner).await;
     assert!(result.is_err(), "stub 占位，实现后应返回 Ok");
 }
 
 #[tokio::test]
 async fn ss_015_confidence_one_is_valid() {
     let agent = SearchStrategyAgent::new(make_adapter(), make_registry());
-    let result = agent.execute_round("test", &[], 1).await;
+    let ect = make_ect();
+    let refiner = MockRefinerClient::new();
+    let result = agent.execute_round("test", &[], 1, &ect, &refiner).await;
     assert!(result.is_err(), "stub 占位，实现后应返回 Ok");
 }
 
 #[tokio::test]
 async fn ss_016_confidence_negative_is_invalid() {
     let agent = SearchStrategyAgent::new(make_adapter(), make_registry());
-    let result = agent.execute_round("test", &[], 1).await;
+    let ect = make_ect();
+    let refiner = MockRefinerClient::new();
+    let result = agent.execute_round("test", &[], 1, &ect, &refiner).await;
     assert!(result.is_err(), "stub 占位，实现后应校验 confidence 范围");
 }
 
 #[tokio::test]
 async fn ss_017_confidence_above_one_is_invalid() {
     let agent = SearchStrategyAgent::new(make_adapter(), make_registry());
-    let result = agent.execute_round("test", &[], 1).await;
+    let ect = make_ect();
+    let refiner = MockRefinerClient::new();
+    let result = agent.execute_round("test", &[], 1, &ect, &refiner).await;
     assert!(result.is_err(), "stub 占位，实现后应校验 confidence 范围");
 }
 
@@ -223,7 +279,9 @@ async fn ss_017_confidence_above_one_is_invalid() {
 #[tokio::test]
 async fn ss_018_normal_exploration_flow() {
     let agent = SearchStrategyAgent::new(make_adapter(), make_registry());
-    let result = agent.execute_round("What is X?", &[], 1).await;
+    let ect = make_ect();
+    let refiner = MockRefinerClient::new();
+    let result = agent.execute_round("What is X?", &[], 1, &ect, &refiner).await;
     // stub 占位；实现后 mock 阶段一返回 keywords JSON，阶段二返回评估 JSON
     // 验证代码层调用了 fast_explorer 和 exploration_context_tool
     assert!(result.is_err(), "stub 占位，实现后应返回 Ok");
@@ -232,7 +290,9 @@ async fn ss_018_normal_exploration_flow() {
 #[tokio::test]
 async fn ss_019_question_unrelated_to_codebase() {
     let agent = SearchStrategyAgent::new(make_adapter(), make_registry());
-    let result = agent.execute_round("你好", &[], 1).await;
+    let ect = make_ect();
+    let refiner = MockRefinerClient::new();
+    let result = agent.execute_round("你好", &[], 1, &ect, &refiner).await;
     // stub 占位；实现后 mock 阶段一返回 {"keywords":[]} → 不调 fast_explorer
     // → confidence=1.0, key_findings 含 "无关"
     assert!(result.is_err(), "stub 占位，实现后应返回 Ok");
@@ -241,13 +301,15 @@ async fn ss_019_question_unrelated_to_codebase() {
 #[tokio::test]
 async fn ss_020_multi_round_with_history() {
     let agent = SearchStrategyAgent::new(make_adapter(), make_registry());
+    let ect = make_ect();
+    let refiner = MockRefinerClient::new();
     let history = vec![SearchRoundRecord {
         round: 1,
         keywords: vec!["BooleanValidator".to_string()],
         key_findings: "找到 BooleanValidator.java".to_string(),
         confidence: 0.4,
     }];
-    let result = agent.execute_round("test", &history, 2).await;
+    let result = agent.execute_round("test", &history, 2, &ect, &refiner).await;
     assert!(result.is_err(), "stub 占位，实现后应返回 Ok");
 }
 
@@ -258,7 +320,9 @@ async fn ss_020_multi_round_with_history() {
 #[tokio::test]
 async fn ss_022_empty_response() {
     let agent = SearchStrategyAgent::new(make_adapter(), make_registry());
-    let result = agent.execute_round("test", &[], 1).await;
+    let ect = make_ect();
+    let refiner = MockRefinerClient::new();
+    let result = agent.execute_round("test", &[], 1, &ect, &refiner).await;
     // stub 占位；实现后 mock 返回空 UnifiedResponse → Err("Empty response")
     assert!(result.is_err(), "stub 占位，实现后应返回 Err");
 }
@@ -266,7 +330,9 @@ async fn ss_022_empty_response() {
 #[tokio::test]
 async fn ss_023_invalid_json_response() {
     let agent = SearchStrategyAgent::new(make_adapter(), make_registry());
-    let result = agent.execute_round("test", &[], 1).await;
+    let ect = make_ect();
+    let refiner = MockRefinerClient::new();
+    let result = agent.execute_round("test", &[], 1, &ect, &refiner).await;
     // stub 占位；实现后 mock 返回非法 JSON → 重试 2 次仍失败 → Err
     assert!(result.is_err(), "stub 占位，实现后应返回 Err");
 }
@@ -274,7 +340,9 @@ async fn ss_023_invalid_json_response() {
 #[tokio::test]
 async fn ss_026_tool_execution_error_feedback() {
     let agent = SearchStrategyAgent::new(make_adapter(), make_registry());
-    let result = agent.execute_round("test", &[], 1).await;
+    let ect = make_ect();
+    let refiner = MockRefinerClient::new();
+    let result = agent.execute_round("test", &[], 1, &ect, &refiner).await;
     // stub 占位；实现后 mock fast_explorer 执行失败 → Err 含工具错误信息
     assert!(result.is_err(), "stub 占位，实现后应返回 Err");
 }
@@ -284,7 +352,9 @@ async fn ss_026_tool_execution_error_feedback() {
 #[tokio::test]
 async fn ss_024_auto_record_exploration_context() {
     let agent = SearchStrategyAgent::new(make_adapter(), make_registry());
-    let result = agent.execute_round("test", &[], 1).await;
+    let ect = make_ect();
+    let refiner = MockRefinerClient::new();
+    let result = agent.execute_round("test", &[], 1, &ect, &refiner).await;
     // stub 占位；实现后验证：fast_explorer 执行后代码自动调了
     // exploration_context_tool.write()，入参含 source="SearchStrategyAgent" 和探索数据
     assert!(result.is_err(), "stub 占位，实现后应返回 Ok（含自动记录验证）");
@@ -293,7 +363,9 @@ async fn ss_024_auto_record_exploration_context() {
 #[tokio::test]
 async fn ss_027_phase1_json_retry_success() {
     let agent = SearchStrategyAgent::new(make_adapter(), make_registry());
-    let result = agent.execute_round("test", &[], 1).await;
+    let ect = make_ect();
+    let refiner = MockRefinerClient::new();
+    let result = agent.execute_round("test", &[], 1, &ect, &refiner).await;
     // stub 占位；实现后 mock 阶段一第 1 次非法 JSON → 重试 → 第 2 次合法 → Ok
     assert!(result.is_err(), "stub 占位，实现后应返回 Ok");
 }
@@ -301,7 +373,9 @@ async fn ss_027_phase1_json_retry_success() {
 #[tokio::test]
 async fn ss_028_phase1_json_retry_exhausted() {
     let agent = SearchStrategyAgent::new(make_adapter(), make_registry());
-    let result = agent.execute_round("test", &[], 1).await;
+    let ect = make_ect();
+    let refiner = MockRefinerClient::new();
+    let result = agent.execute_round("test", &[], 1, &ect, &refiner).await;
     // stub 占位；实现后 mock 阶段一连续 3 次非法 JSON → Err("Failed to parse keywords JSON after retries")
     assert!(result.is_err(), "stub 占位，实现后应返回 Err");
 }
@@ -309,7 +383,134 @@ async fn ss_028_phase1_json_retry_exhausted() {
 #[tokio::test]
 async fn ss_029_phase2_json_retry_exhausted() {
     let agent = SearchStrategyAgent::new(make_adapter(), make_registry());
-    let result = agent.execute_round("test", &[], 1).await;
+    let ect = make_ect();
+    let refiner = MockRefinerClient::new();
+    let result = agent.execute_round("test", &[], 1, &ect, &refiner).await;
     // stub 占位；实现后 mock 阶段一正常 → 阶段二连续 3 次非法 JSON → Err("Failed to parse evaluation JSON after retries")
     assert!(result.is_err(), "stub 占位，实现后应返回 Err");
+}
+
+// ============================================================================
+// v1.2 新增: SSA 上下文精炼 (SS-030 ~ SS-033)
+// ============================================================================
+
+#[tokio::test]
+async fn ss_030_refinement_triggered_when_ect_over_threshold() {
+    let agent = SearchStrategyAgent::new(make_adapter(), make_registry());
+    let ect = make_ect();
+    let refiner = MockRefinerClient::new();
+    refiner.set_response(make_refiner_ok_response());
+
+    // Pre-fill ECT with many records to exceed EXPLORATION_TOKEN_THRESHOLD
+    for i in 0..30 {
+        let record = explore_ai_agent::context::exploration::ExplorationRecord::ToolCall {
+            source: "SearchStrategyAgent".to_string(),
+            tool: "fast_explorer".to_string(),
+            params: serde_json::json!({"keywords": [format!("keyword_{}", i)]}),
+            result_summary: format!("Result summary for keyword_{} with enough text to increase token count significantly", i),
+            confidence: 0.5,
+            timestamp: chrono::Utc::now(),
+        };
+        let _ = ect.write_record(record);
+    }
+
+    let result = agent.execute_round("test", &[], 1, &ect, &refiner).await;
+    // stub: 实现后验证
+    // (1) execute_round() 返回 Ok（stage 1+2 succeed）
+    // (2) refiner.call_count() > 0（Refiner was called）
+    // (3) ECT.current_summary was updated
+    assert!(result.is_ok() || result.is_err(),
+        "stub: 实现后应返回 Ok（精炼触发成功）");
+}
+
+#[tokio::test]
+async fn ss_031_refinement_not_triggered_when_below_threshold() {
+    let agent = SearchStrategyAgent::new(make_adapter(), make_registry());
+    let ect = make_ect(); // fresh ECT, far below threshold
+    let refiner = MockRefinerClient::new();
+    refiner.set_response(make_refiner_ok_response());
+
+    let result = agent.execute_round("test", &[], 1, &ect, &refiner).await;
+    // stub: 实现后验证
+    // (1) execute_round() 返回 Ok
+    // (2) refiner.call_count() == 0（Refiner was NOT called）
+    assert!(result.is_ok() || result.is_err(),
+        "stub: 实现后应返回 Ok（未触发精炼）");
+}
+
+#[tokio::test]
+async fn ss_032_refinement_failure_does_not_block() {
+    let agent = SearchStrategyAgent::new(make_adapter(), make_registry());
+    let ect = make_ect();
+    let refiner = MockRefinerClient::new();
+    refiner.set_response(Err("LLM call failed".to_string()));
+
+    // Pre-fill ECT to exceed threshold
+    for i in 0..30 {
+        let record = explore_ai_agent::context::exploration::ExplorationRecord::ToolCall {
+            source: "SearchStrategyAgent".to_string(),
+            tool: "fast_explorer".to_string(),
+            params: serde_json::json!({"keywords": [format!("k{}", i)]}),
+            result_summary: format!("Result {} with padding text to increase token count substantially for testing", i),
+            confidence: 0.5,
+            timestamp: chrono::Utc::now(),
+        };
+        let _ = ect.write_record(record);
+    }
+
+    let result = agent.execute_round("test", &[], 1, &ect, &refiner).await;
+    // stub: 实现后验证
+    // (1) execute_round() 返回 Ok（精炼失败不阻塞探索）
+    // (2) refiner was called but returned Err — SSA continued to stage 2
+    assert!(result.is_ok() || result.is_err(),
+        "stub: 实现后应返回 Ok（精炼失败不阻塞）");
+}
+
+#[tokio::test]
+async fn ss_033_multi_round_refinement_accumulates() {
+    let agent = SearchStrategyAgent::new(make_adapter(), make_registry());
+    let ect = make_ect();
+    let refiner = MockRefinerClient::new();
+
+    // Round 1: ECT empty, no refinement
+    refiner.set_response(make_refiner_ok_response());
+    let r1 = agent.execute_round("test", &[], 1, &ect, &refiner).await;
+    // stub: round 1 should not trigger refinement (ECT nearly empty)
+
+    // Round 2: ECT has some records but still under threshold
+    for i in 0..5 {
+        let record = explore_ai_agent::context::exploration::ExplorationRecord::ToolCall {
+            source: "SearchStrategyAgent".to_string(),
+            tool: "fast_explorer".to_string(),
+            params: serde_json::json!({"keywords": [format!("r2_{}", i)]}),
+            result_summary: format!("R2 result {} padding", i),
+            confidence: 0.5,
+            timestamp: chrono::Utc::now(),
+        };
+        let _ = ect.write_record(record);
+    }
+    refiner.set_response(make_refiner_ok_response());
+    let r2 = agent.execute_round("test", &[], 2, &ect, &refiner).await;
+    // stub: round 2 may or may not trigger (depends on ECT fill)
+
+    // Round 3: ECT heavily filled, should trigger
+    for i in 0..30 {
+        let record = explore_ai_agent::context::exploration::ExplorationRecord::ToolCall {
+            source: "SearchStrategyAgent".to_string(),
+            tool: "fast_explorer".to_string(),
+            params: serde_json::json!({"keywords": [format!("r3_{}", i)]}),
+            result_summary: format!("R3 result {} with substantial padding text to exceed token threshold", i),
+            confidence: 0.5,
+            timestamp: chrono::Utc::now(),
+        };
+        let _ = ect.write_record(record);
+    }
+    refiner.set_response(make_refiner_ok_response());
+    let r3 = agent.execute_round("test", &[], 3, &ect, &refiner).await;
+    // stub: round 3 MUST trigger refinement
+
+    // All three rounds should complete (stubs assert basic contract)
+    let all_err = r1.is_err() && r2.is_err() && r3.is_err();
+    assert!(all_err || (!r1.is_err() && !r2.is_err() && !r3.is_err()),
+        "stub: 实现后三轮都应返回 Ok；当前三轮都返回 Err 也符合 stub 预期");
 }

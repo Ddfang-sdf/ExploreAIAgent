@@ -9,8 +9,6 @@ llm:
 exploration:
   token_threshold: 12000
   token_target_ratio: 0.40
-  max_fast_explore_rounds: 3
-  early_termination_confidence: 0.8
 
 workspace:
   path: "./workspace"

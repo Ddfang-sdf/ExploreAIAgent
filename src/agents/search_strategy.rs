@@ -66,6 +66,8 @@ impl SearchStrategyAgent {
         question: &str,
         exploration_history: &[SearchRoundRecord],
         round: usize,
+        ect: &crate::context::exploration::ExplorationContextTool,
+        refiner_client: &dyn crate::adapter::api_adapter::LlmStructuredClient,
     ) -> Result<SearchStrategyResult, String> {
         // ======================================================================
         // Phase 1: Keywords design (call_llm_structured → forced JSON output)
@@ -129,6 +131,50 @@ impl SearchStrategyAgent {
                 }
             }),
         );
+
+        // ======================================================================
+        // Phase 2.5: Context refinement (v1.2 — Refinement下沉到SSA内部)
+        // Per ExplorationRefinerAgent v1.1 Section 6.5 / SSA v1.2 Section 3.2.3
+        // ======================================================================
+        if ect.needs_compression() {
+            let ect_summary = ect
+                .get_current_summary()
+                .unwrap_or(crate::context::exploration::ExplorationSummary {
+                    key_findings: String::new(),
+                    critical_files: vec![],
+                    missing_info: String::new(),
+                    confidence: 0.0,
+                });
+            let history = ect.get_history();
+            let recent_records: Vec<_> = history.into_iter().rev().take(15).collect();
+
+            let threshold = crate::context::exploration::EXPLORATION_TOKEN_THRESHOLD;
+            let target_token_limit =
+                ((threshold as f64) * 0.10_f64).max(300.0) as usize;
+
+            let refiner = crate::agents::exploration_refiner::ExplorationRefinerAgent::new();
+            let refinement_result = refiner
+                .refine(
+                    question,
+                    &ect_summary,
+                    &recent_records,
+                    target_token_limit,
+                    refiner_client,
+                )
+                .await;
+
+            match refinement_result {
+                Ok(new_summary) => {
+                    let _ = ect.update_summary(new_summary);
+                }
+                Err(refine_err) => {
+                    eprintln!(
+                        "[WARN] SSA refinement failed (non-blocking): {}",
+                        refine_err
+                    );
+                }
+            }
+        }
 
         // ======================================================================
         // Phase 3: Evaluate with response_format (call_llm_structured)

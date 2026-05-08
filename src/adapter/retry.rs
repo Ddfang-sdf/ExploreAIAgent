@@ -45,6 +45,8 @@ impl ApiAdapter {
                 Err(e) => {
                     if retry_count < max_retries {
                         retry_count += 1;
+                        let delay_secs = (1u64 << retry_count).min(8);
+                        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                         continue;
                     }
                     return Err(format!("LLM call failed after {} retries: {}", max_retries, e));
@@ -139,7 +141,7 @@ impl ApiAdapter {
         let body_str = serde_json::to_string(&body)
             .map_err(|e| format!("Failed to serialize request body: {}", e))?;
 
-        let timeout_dur = std::time::Duration::from_secs(15);
+        let timeout_dur = std::time::Duration::from_secs(60);
         let result = tokio::time::timeout(
             timeout_dur,
             tokio::task::spawn_blocking(move || {
@@ -173,8 +175,8 @@ impl ApiAdapter {
             Ok(Ok(inner)) => inner,
             Ok(Err(join_err)) => Err(format!("Task join error: {}", join_err)),
             Err(_elapsed) => {
-                eprintln!("[WARN] HTTP timeout after 15s, retrying...");
-                Err("HTTP timeout after 15s".to_string())
+                eprintln!("[WARN] HTTP timeout after 60s, retrying...");
+                Err("HTTP timeout after 60s".to_string())
             }
         }
     }

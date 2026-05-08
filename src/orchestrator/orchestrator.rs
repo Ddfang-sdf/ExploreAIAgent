@@ -156,7 +156,7 @@ impl Orchestrator {
 
         for round in 1..=self.max_fast_explore_rounds {
             let result = ssa
-                .execute_round(question, &history, round)
+                .execute_round(question, &history, round, exploration_context, self.adapter.as_ref())
                 .await
                 .map_err(|e| format!("SearchStrategyAgent round {}: {}", round, e))?;
 
@@ -187,29 +187,8 @@ impl Orchestrator {
                 confidence: result.confidence,
             });
 
-            // Check token threshold → ExplorationRefinerAgent
-            if exploration_context.needs_compression() {
-                let summary = exploration_context
-                    .get_current_summary()
-                    .unwrap_or(ExplorationSummary {
-                        key_findings: String::new(),
-                        critical_files: vec![],
-                        missing_info: String::new(),
-                        confidence: 0.0,
-                    });
-                let recent = exploration_context.get_history();
-                let recent_slice: Vec<ExplorationRecord> =
-                    recent.into_iter().rev().take(15).collect();
-                // Design doc 6.2: target = max(300, THRESHOLD × 0.10)
-                let threshold = crate::context::exploration::EXPLORATION_TOKEN_THRESHOLD;
-                let target = ((threshold as f64) * 0.10_f64).max(300.0) as usize;
-                if let Ok(refined) = refiner
-                    .refine(question, &summary, &recent_slice, target, llm_client)
-                    .await
-                {
-                    let _ = exploration_context.update_summary(refined);
-                }
-            }
+            // v1.2: Context refinement is now internal to SSA (done inside execute_round).
+            // The orchestrator no longer manages SSA context compression.
 
             // Check early termination
             if self.should_early_terminate(result.confidence, round) {
