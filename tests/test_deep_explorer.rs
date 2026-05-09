@@ -368,6 +368,7 @@ impl MockDualClient {
         self.structured_responses.lock().unwrap().push(resp);
     }
 
+    #[allow(dead_code)]
     fn structured_call_count(&self) -> usize {
         *self.structured_call_count.lock().unwrap()
     }
@@ -408,6 +409,7 @@ fn make_done_response() -> Result<UnifiedResponse, String> {
     Ok(UnifiedResponse {
         text: Some(r#"{"action":"done","result":{"critical_files":[],"collected_evidence":[],"missing_info":"无"},"reasoning":"done"}"#.to_string()),
         tool_calls: vec![],
+        reasoning: None,
     })
 }
 
@@ -418,6 +420,7 @@ fn make_tool_call_response(tool: &str, file: &str) -> Result<UnifiedResponse, St
             tool, file
         )),
         tool_calls: vec![],
+        reasoning: None,
     })
 }
 
@@ -430,6 +433,7 @@ fn make_large_search_response() -> Result<UnifiedResponse, String> {
     Ok(UnifiedResponse {
         text: Some(r#"{"action":"tool_call","tool":"search_content","params":{"pattern":"backtest"},"reasoning":"搜索回测相关代码"}"#.to_string()),
         tool_calls: vec![],
+        reasoning: None,
     })
 }
 
@@ -440,6 +444,15 @@ fn make_refiner_summary_response() -> Result<UnifiedResponse, String> {
                 .to_string(),
         ),
         tool_calls: vec![],
+        reasoning: None,
+    })
+}
+
+fn make_tr_response(summary: &str) -> Result<UnifiedResponse, String> {
+    Ok(UnifiedResponse {
+        text: Some(format!(r#"{{"summary":"{}"}}"#, summary)),
+        tool_calls: vec![],
+        reasoning: None,
     })
 }
 
@@ -454,6 +467,14 @@ async fn de_026_messages_overflow_triggers_refinement() {
 
     // DE explores: first call returns a tool_call that will produce large output
     mock.push_tool_response(make_large_search_response());
+    // QE after first tool_call
+    mock.push_structured_response(Ok(UnifiedResponse {
+        text: Some(r#"{"key_findings":"found","critical_files":[],"missing_info":"","confidence":0.8}"#.to_string()),
+        tool_calls: vec![],
+        reasoning: None,
+    }));
+    // TR after first tool_call (v1.3)
+    mock.push_structured_response(make_tr_response("搜索回测相关代码，找到 engine.py"));
     // After refinement, DE continues and LLM responds with done
     mock.push_tool_response(make_done_response());
     // Refiner is called during context refinement
@@ -486,14 +507,20 @@ async fn de_027_messages_rebuilt_after_refinement() {
     mock.push_structured_response(Ok(UnifiedResponse {
         text: Some(r#"{"key_findings":"found","critical_files":[],"missing_info":"","confidence":0.8}"#.to_string()),
         tool_calls: vec![],
+        reasoning: None,
     }));
+    // TR after first tool_call (v1.3)
+    mock.push_structured_response(make_tr_response("搜索回测相关代码，找到 engine.py"));
     // After refinement, DE resumes: read_file
     mock.push_tool_response(make_tool_call_response("read_file", "src/backtest.rs"));
     // QE after second tool_call
     mock.push_structured_response(Ok(UnifiedResponse {
         text: Some(r#"{"key_findings":"found","critical_files":[],"missing_info":"","confidence":0.7}"#.to_string()),
         tool_calls: vec![],
+        reasoning: None,
     }));
+    // TR after second tool_call (v1.3)
+    mock.push_structured_response(make_tr_response("读取 engine.py — 找到 BacktestEngine 类"));
     // Then done
     mock.push_tool_response(make_done_response());
     // Refiner returns a summary
@@ -524,7 +551,10 @@ async fn de_028_refinement_failure_degradation() {
     mock.push_structured_response(Ok(UnifiedResponse {
         text: Some(r#"{"key_findings":"found","critical_files":[],"missing_info":"","confidence":0.8}"#.to_string()),
         tool_calls: vec![],
+        reasoning: None,
     }));
+    // TR after first tool_call (v1.3)
+    mock.push_structured_response(make_tr_response("搜索回测相关代码，找到 engine.py"));
     // Refiner fails
     mock.push_structured_response(Err("LLM call failed".to_string()));
     // After degradation truncation, DE continues: read_file
@@ -533,7 +563,10 @@ async fn de_028_refinement_failure_degradation() {
     mock.push_structured_response(Ok(UnifiedResponse {
         text: Some(r#"{"key_findings":"found","critical_files":[],"missing_info":"","confidence":0.7}"#.to_string()),
         tool_calls: vec![],
+        reasoning: None,
     }));
+    // TR after second tool_call (v1.3)
+    mock.push_structured_response(make_tr_response("读取 engine.py — BacktestEngine 类"));
     // Then done
     mock.push_tool_response(make_done_response());
 
@@ -560,14 +593,34 @@ async fn de_029_degradation_limit_terminates_loop() {
 
     // Cycle 1: overflow → Refiner fails → degradation
     mock.push_tool_response(make_large_search_response());
+    // QE + TR after tool_call (v1.3)
+    mock.push_structured_response(Ok(UnifiedResponse {
+        text: Some(r#"{"key_findings":"found","critical_files":[],"missing_info":"","confidence":0.8}"#.to_string()),
+        tool_calls: vec![],
+        reasoning: None,
+    }));
+    mock.push_structured_response(make_tr_response("搜索回测代码"));
+    // Refiner fails
     mock.push_structured_response(Err("LLM call failed".to_string()));
     // After truncation, DE tries again: another large result
     mock.push_tool_response(make_large_search_response());
-    // Cycle 2: Refiner fails again
+    // Cycle 2: QE + TR, then Refiner fails again
+    mock.push_structured_response(Ok(UnifiedResponse {
+        text: Some(r#"{"key_findings":"found","critical_files":[],"missing_info":"","confidence":0.8}"#.to_string()),
+        tool_calls: vec![],
+        reasoning: None,
+    }));
+    mock.push_structured_response(make_tr_response("再次搜索回测代码"));
     mock.push_structured_response(Err("LLM call failed".to_string()));
     // After truncation: yet another large result
     mock.push_tool_response(make_large_search_response());
-    // Cycle 3: Refiner fails third time → degradation_count = 3 → terminate
+    // Cycle 3: QE + TR, then Refiner fails third time → degradation_count = 3 → terminate
+    mock.push_structured_response(Ok(UnifiedResponse {
+        text: Some(r#"{"key_findings":"found","critical_files":[],"missing_info":"","confidence":0.8}"#.to_string()),
+        tool_calls: vec![],
+        reasoning: None,
+    }));
+    mock.push_structured_response(make_tr_response("第三次搜索回测代码"));
     mock.push_structured_response(Err("LLM call failed".to_string()));
     // Provide extra fallback responses in case the current stub code path
     // continues looping (old truncation, not yet replaced with Refiner).
@@ -607,12 +660,14 @@ async fn de_030_qe_called_per_tool_call() {
     mock.push_tool_response(make_tool_call_response("read_file", "src/a.rs"));
     mock.push_tool_response(make_tool_call_response("search_content", "src/b.rs"));
     mock.push_tool_response(make_done_response());
-    // QE called 3 times (once per tool_call)
+    // QE + TR per tool_call (v1.3: TR added)
     for _ in 0..3 {
         mock.push_structured_response(Ok(UnifiedResponse {
             text: Some(r#"{"key_findings":"ok","critical_files":[],"missing_info":"","confidence":0.8}"#.to_string()),
             tool_calls: vec![],
+            reasoning: None,
         }));
+        mock.push_structured_response(make_tr_response("探索搜索结果"));
     }
 
     let _ = de.execute("test question", &make_summary(), &mock, &registry, &ect).await;
@@ -631,10 +686,14 @@ async fn de_031_confidence_written_to_ect() {
 
     mock.push_tool_response(make_tool_call_response("search_content", "src/a.rs"));
     mock.push_tool_response(make_done_response());
+    // QE
     mock.push_structured_response(Ok(UnifiedResponse {
         text: Some(r#"{"key_findings":"found","critical_files":[],"missing_info":"","confidence":0.75}"#.to_string()),
         tool_calls: vec![],
+        reasoning: None,
     }));
+    // TR (v1.3)
+    mock.push_structured_response(make_tr_response("搜索到 src/a.rs 中的相关代码"));
 
     let _ = de.execute("test question", &make_summary(), &mock, &registry, &ect).await;
     // stub: 实现后 ECT 中 ToolCall 记录的 confidence = 0.75
@@ -655,14 +714,22 @@ async fn de_032_qe_failure_does_not_block() {
     mock.push_structured_response(Ok(UnifiedResponse {
         text: Some(r#"{"key_findings":"ok","critical_files":[],"missing_info":"","confidence":0.8}"#.to_string()),
         tool_calls: vec![],
+        reasoning: None,
     }));
+    // TR after tool_call #1 (v1.3)
+    mock.push_structured_response(make_tr_response("探索结果 1"));
     mock.push_tool_response(make_tool_call_response("read_file", "src/a.rs"));
-    mock.push_structured_response(Err("QE call failed".to_string())); // fail #2
+    mock.push_structured_response(Err("QE call failed".to_string())); // QE fail #2
+    // TR after tool_call #2 (v1.3) — TR still runs even if QE failed
+    mock.push_structured_response(make_tr_response("探索结果 2"));
     mock.push_tool_response(make_tool_call_response("search_content", "src/b.rs"));
     mock.push_structured_response(Ok(UnifiedResponse {
         text: Some(r#"{"key_findings":"ok","critical_files":[],"missing_info":"","confidence":0.7}"#.to_string()),
         tool_calls: vec![],
+        reasoning: None,
     }));
+    // TR after tool_call #3 (v1.3)
+    mock.push_structured_response(make_tr_response("探索结果 3"));
     mock.push_tool_response(make_done_response());
 
     let result = de.execute("test question", &make_summary(), &mock, &registry, &ect).await;
@@ -682,10 +749,14 @@ async fn de_033_qe_receives_truncated_data() {
     // Large search result
     mock.push_tool_response(make_large_search_response());
     mock.push_tool_response(make_done_response());
+    // QE
     mock.push_structured_response(Ok(UnifiedResponse {
         text: Some(r#"{"key_findings":"truncated ok","critical_files":[],"missing_info":"","confidence":0.6}"#.to_string()),
         tool_calls: vec![],
+        reasoning: None,
     }));
+    // TR (v1.3)
+    mock.push_structured_response(make_tr_response("搜索到大量回测相关代码"));
 
     let _ = de.execute("test question", &make_summary(), &mock, &registry, &ect).await;
     // stub: 代码层调 QE 时传入的 exploration_data 被截断至 ≤2500 chars
@@ -703,13 +774,17 @@ async fn de_034_code_layer_processing_order() {
 
     mock.push_tool_response(make_tool_call_response("search_content", "src/a.rs"));
     mock.push_tool_response(make_done_response());
+    // QE
     mock.push_structured_response(Ok(UnifiedResponse {
         text: Some(r#"{"key_findings":"ordered","critical_files":[],"missing_info":"","confidence":0.8}"#.to_string()),
         tool_calls: vec![],
+        reasoning: None,
     }));
+    // TR (v1.3)
+    mock.push_structured_response(make_tr_response("搜索到 src/a.rs 中的有序代码"));
 
     let _ = de.execute("test question", &make_summary(), &mock, &registry, &ect).await;
-    // stub: 实现后验证调用顺序为 write_record(ECT)→refine_check→QE→write_confidence→追加messages
+    // stub: 实现后验证调用顺序为 write_record(ECT)→QE→write_confidence→TR→追加messages→裁剪
     assert!(true, "stub 占位");
 }
 

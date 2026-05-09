@@ -10,5 +10,10 @@ exploration:
   token_threshold: 12000
   token_target_ratio: 0.40
 
+deep_explorer:
+  enable: true
+  max_tool_calls: 75
+  loop_warning_threshold: 3
+
 workspace:
   path: "./workspace"

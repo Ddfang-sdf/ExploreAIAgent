@@ -5,7 +5,8 @@ use crate::common::error::{ErrorCode, ToolError};
 use crate::common::models::{ToolInput, ToolOutput};
 use crate::common::path_manager::PathManager;
 use crate::common::config::ToolsConfig;
-use crate::common::truncation::{MAX_SHELL_OUTPUT_BYTES, SHELL_TIMEOUT_SECS};
+use crate::common::truncation::{MAX_SHELL_OUTPUT_BYTES, MAX_SHELL_OUTPUT_LINES, SHELL_TIMEOUT_SECS};
+use crate::common::truncation::TruncationManager;
 use crate::ffi_bridge::{ShellExecutorFFI};
 use super::executor::ToolExecutor;
 
@@ -63,70 +64,86 @@ impl ShellSecurity {
     }
 
     pub fn check_dangerous_operators(command: &str) -> Result<(), String> {
-        // --- output redirect ---
-        if command.contains(">>") {
-            return Err("Append redirect >> detected".to_string());
-        }
+        let chars: Vec<char> = command.chars().collect();
+        let len = chars.len();
 
-        // tee can write to files (same category as redirect)
+        // Helper: advance past a quoted segment, returns index after closing quote
+        let skip_quoted = |chars: &[char], mut i: usize, quote: char| -> usize {
+            i += 1; // skip opening quote
+            while i < chars.len() {
+                if quote == '"' && chars[i] == '\\' && i + 1 < chars.len() {
+                    i += 2; // skip escaped char
+                } else if chars[i] == quote {
+                    return i + 1; // skip closing quote
+                } else {
+                    i += 1;
+                }
+            }
+            i // unterminated quote, go to end
+        };
+
+        // tee token check (whole-word match outside quotes)
         {
             let tokens: Vec<&str> = command.split_whitespace().collect();
             for token in &tokens {
-                if *token == "tee" {
+                let trimmed = token.trim_matches(&['\'', '"'][..]);
+                if trimmed == "tee" {
                     return Err("tee command detected (dangerous: can write files)".to_string());
                 }
             }
         }
 
-        // --- command substitution ---
-        if command.contains("$(") {
-            return Err("Command substitution $() detected".to_string());
-        }
-        if command.contains('`') {
-            return Err("Backtick command substitution detected".to_string());
+        let mut i = 0;
+        while i < len {
+            // Skip quoted content entirely
+            if chars[i] == '\'' || chars[i] == '"' {
+                i = skip_quoted(&chars, i, chars[i]);
+                continue;
+            }
+
+            // Command substitution
+            if chars[i] == '$' && i + 1 < len && chars[i + 1] == '(' {
+                return Err("Command substitution $() detected".to_string());
+            }
+            if chars[i] == '`' {
+                return Err("Backtick command substitution detected".to_string());
+            }
+
+            // Command separator
+            if chars[i] == ';' {
+                return Err("Command separator ; detected".to_string());
+            }
+
+            // Logical operators
+            if chars[i] == '&' && i + 1 < len && chars[i + 1] == '&' {
+                return Err("Logical AND && detected".to_string());
+            }
+            if chars[i] == '|' && i + 1 < len && chars[i + 1] == '|' {
+                return Err("Logical OR || detected".to_string());
+            }
+
+            // Output redirect >
+            if chars[i] == '>' {
+                if i + 1 < len && chars[i + 1] == '>' {
+                    return Err("Append redirect >> detected".to_string());
+                }
+                return Err("Output redirect > detected".to_string());
+            }
+
+            // Path traversal
+            if (i + 2 < len && chars[i] == '.' && chars[i+1] == '.' && chars[i+2] == '/')
+                || (i + 2 < len && chars[i] == '.' && chars[i+1] == '.' && chars[i+2] == '\\')
+            {
+                return Err("Path traversal ../ detected".to_string());
+            }
+
+            i += 1;
         }
 
-        // --- command separators ---
-        if command.contains(';') {
-            return Err("Command separator ; detected".to_string());
-        }
-        if command.contains("&&") {
-            return Err("Logical AND && detected".to_string());
-        }
-        if command.contains("||") {
-            return Err("Logical OR || detected".to_string());
-        }
-
-        // --- system calls in awk etc. ---
+        // system(/exec( checks: these are dangerous even inside quotes
+        // (awk's system() calls the OS directly, bypassing our whitelist)
         if command.contains("system(") || command.contains("exec(") {
             return Err("System/exec call detected in command".to_string());
-        }
-
-        // --- path traversal ---
-        if command.contains("../") || command.contains("..\\") {
-            return Err("Path traversal ../ detected".to_string());
-        }
-
-        // --- single > (not >>) ---
-        let has_redirect = {
-            let chars: Vec<char> = command.chars().collect();
-            let mut found = false;
-            for i in 0..chars.len() {
-                if chars[i] == '>' {
-                    if i + 1 < chars.len() && chars[i + 1] == '>' {
-                        continue;
-                    }
-                    if i > 0 && chars[i - 1] == '>' {
-                        continue;
-                    }
-                    found = true;
-                    break;
-                }
-            }
-            found
-        };
-        if has_redirect {
-            return Err("Output redirect > detected".to_string());
         }
 
         // --- background & (not &&) ---
@@ -249,6 +266,115 @@ pub struct ExecuteShellTool {
     path_manager: PathManager,
     shell_timeout_secs: u32,
     shell_max_output_bytes: usize,
+    pub shell_path: String,
+}
+
+/// Discover the best available shell on this system.
+fn discover_shell() -> String {
+    let shells = discover_all_shells();
+    shells.into_iter().next().unwrap_or_else(|| {
+        #[cfg(target_os = "windows")] { "cmd.exe".to_string() }
+        #[cfg(not(target_os = "windows"))] { "/bin/sh".to_string() }
+    })
+}
+
+/// Collect all available shells sorted by capability (best first).
+fn discover_all_shells() -> Vec<String> {
+    let mut shells: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    #[cfg(target_os = "windows")]
+    {
+        // 1. Git Bash via git location (most reliable — OpenCode approach)
+        if let Some(gb) = find_git_bash() {
+            seen.insert(gb.clone());
+            shells.push(gb);
+        }
+
+        // 2. Known full-featured bash paths
+        for p in &[r"C:\Program Files\Git\bin\bash.exe", r"C:\msys64\usr\bin\bash.exe"] {
+            if std::path::Path::new(p).exists() && seen.insert(p.to_string()) {
+                shells.push(p.to_string());
+            }
+        }
+
+        // 3. PATH scan: bash (prefer bin/ over usr\bin/), then pwsh
+        if let Ok(path) = std::env::var("PATH") {
+            let mut usr_bin_bash: Option<String> = None;
+            for dir in std::env::split_paths(&path) {
+                for name in &["bash.exe", "pwsh.exe"] {
+                    let p = dir.join(name);
+                    if !p.exists() { continue; }
+                    let s = p.to_string_lossy().to_string();
+                    if seen.contains(&s) { continue; }
+                    seen.insert(s.clone());
+                    if *name == "pwsh.exe" {
+                        shells.push(s);
+                    } else if !s.contains("usr\\bin") {
+                        shells.push(s); // bin/bash preferred
+                    } else {
+                        usr_bin_bash = Some(s); // deferred
+                    }
+                }
+            }
+            if let Some(b) = usr_bin_bash { shells.push(b); }
+        }
+
+        // 4. PowerShell from known locations
+        for p in &[r"C:\Program Files\PowerShell\7\pwsh.exe",
+                   r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"] {
+            if std::path::Path::new(p).exists() && seen.insert(p.to_string()) {
+                shells.push(p.to_string());
+            }
+        }
+
+        // 5. cmd.exe last
+        shells.push("cmd.exe".to_string());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        for p in &["/bin/bash", "/bin/zsh", "/bin/sh"] {
+            if std::path::Path::new(p).exists() && seen.insert(p.to_string()) {
+                shells.push(p.to_string());
+            }
+        }
+    }
+
+    shells
+}
+
+/// Find Git Bash by locating git.exe and deriving bash path from it.
+/// Mirrors OpenCode's gitbash(): `which git` → `../../bin/bash.exe`
+#[cfg(target_os = "windows")]
+fn find_git_bash() -> Option<String> {
+    // Try "where git" to find git.exe, then resolve ../bin/bash.exe
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let git = dir.join("git.exe");
+            if git.exists() {
+                // Git Bash is at <git_root>/bin/bash.exe
+                // git.exe is typically at <git_root>/cmd/git.exe or <git_root>/bin/git.exe
+                for relative in &[r"..\bin\bash.exe", r"..\..\bin\bash.exe"] {
+                    if let Ok(resolved) = git.canonicalize() {
+                        let parent = resolved.parent()?;
+                        let bash = parent.join(relative);
+                        if let Ok(canon) = bash.canonicalize() {
+                            if canon.exists() {
+                                return Some(canon.to_string_lossy().to_string());
+                            }
+                        }
+                        // Try without canonicalize (some paths may not resolve)
+                        let bash2 = std::path::Path::new(&dir).join(relative);
+                        if bash2.exists() {
+                            return Some(bash2.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 impl ExecuteShellTool {
@@ -257,6 +383,7 @@ impl ExecuteShellTool {
             path_manager: PathManager::new(project_root),
             shell_timeout_secs: SHELL_TIMEOUT_SECS,
             shell_max_output_bytes: MAX_SHELL_OUTPUT_BYTES,
+            shell_path: discover_shell(),
         }
     }
 
@@ -265,6 +392,7 @@ impl ExecuteShellTool {
             path_manager: PathManager::new(project_root),
             shell_timeout_secs: config.shell_timeout_secs,
             shell_max_output_bytes: config.shell_max_output_bytes,
+            shell_path: discover_shell(),
         }
     }
 }
@@ -310,14 +438,26 @@ impl ToolExecutor for ExecuteShellTool {
             &working_dir_str,
             self.shell_timeout_secs as i32,
             self.shell_max_output_bytes,
+            &self.shell_path,
         );
 
         match result {
             Ok(shell_output) => {
-                let truncated = shell_output.output_truncated;
+                // C-layer byte truncation
+                let mut truncated = shell_output.output_truncated;
+                let mut output_text = shell_output.output;
+
+                // Rust-layer line truncation (2000 lines, per design doc 7.3)
+                let (trimmed, line_truncated) =
+                    TruncationManager::truncate_lines(&output_text, MAX_SHELL_OUTPUT_LINES);
+                if line_truncated {
+                    output_text = trimmed.to_string();
+                    truncated = true;
+                }
+
                 let output = ExecuteShellOutput {
                     success: shell_output.success,
-                    output: shell_output.output,
+                    output: output_text,
                     error: if shell_output.success { None } else { Some(format!("Exit code: {}", shell_output.exit_code)) },
                 };
                 Ok(ToolOutput::new(serde_json::to_value(output).unwrap())

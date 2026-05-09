@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use explore_ai_agent::adapter::api_adapter::{ApiAdapter, ApiMode};
 use explore_ai_agent::cli;
-use explore_ai_agent::common::config::AppConfig;
+use explore_ai_agent::common::config::{AppConfig, DeepExplorerConfig};
 use explore_ai_agent::conversation::manager::ConversationManager;
 use explore_ai_agent::orchestrator::orchestrator::Orchestrator;
 use explore_ai_agent::tools::registry::ToolRegistry;
@@ -31,7 +31,7 @@ fn make_conversation_manager() -> ConversationManager {
 }
 
 fn make_orchestrator() -> Orchestrator {
-    Orchestrator::new(make_adapter(), make_registry(), make_conversation_manager())
+    Orchestrator::new(make_adapter(), make_registry(), make_conversation_manager(), DeepExplorerConfig::default())
 }
 
 fn make_app_state() -> AppState {

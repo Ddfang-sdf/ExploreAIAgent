@@ -18,6 +18,11 @@ pub trait DeepExploreExecutor: Send + Sync {
     ) -> Result<serde_json::Value, String>;
 }
 
+#[async_trait::async_trait]
+pub trait ShellExecutor: Send + Sync {
+    async fn execute(&self, command: &str) -> Result<serde_json::Value, String>;
+}
+
 pub struct MainAgent;
 
 impl MainAgent {
@@ -31,10 +36,30 @@ impl MainAgent {
         question: &str,
         conversation_context: &str,
         fast_explore: &dyn FastExploreExecutor,
-        de: &dyn DeepExploreExecutor,
+        de: Option<&dyn DeepExploreExecutor>,
+        shell: &dyn ShellExecutor,
         client: &dyn LlmToolClient,
     ) -> Result<String, String> {
-        let system_prompt = Self::assemble_prompt();
+        let enable_de = de.is_some();
+        let system_prompt_raw = Self::assemble_prompt();
+        let system_prompt = if enable_de {
+            system_prompt_raw
+        } else {
+            // Strip deep_explore section when DE is disabled
+            if let Some(start) = system_prompt_raw.find("### deep_explore") {
+                let after_start = &system_prompt_raw[start..];
+                if let Some(end_offset) = after_start.find("\n### execute_shell") {
+                    format!("{}{}", &system_prompt_raw[..start], &after_start[end_offset..])
+                } else {
+                    system_prompt_raw
+                }
+            } else {
+                system_prompt_raw
+            }
+        };
+        let system_prompt = system_prompt
+            .replace("{shell_info}", &Self::shell_info())
+            .replace("{shell_commands}", &Self::shell_commands());
         let user_content = if conversation_context.is_empty() {
             question.to_string()
         } else {
@@ -46,7 +71,7 @@ impl MainAgent {
             serde_json::json!({"role": "user", "content": user_content}),
         ];
 
-        let schema = Self::action_schema();
+        let _schema = Self::action_schema();
         let mut parse_retries: usize = 0;
         const MAX_PARSE_RETRIES: usize = 2;
         let mut first_call = true;
@@ -132,26 +157,61 @@ impl MainAgent {
                             }
                         }
                         "deep_explore" => {
-                            eprintln!("\r\x1b[K🔍 正在深入探索代码...");
-                            let de_question = action_json
-                                .get("arguments")
-                                .and_then(|a| a.get("question"))
-                                .and_then(|q| q.as_str())
-                                .unwrap_or(question);
-                            let summary = action_json.get("arguments").and_then(|a| a.get("current_summary"));
+                            if let Some(de) = de {
+                                eprintln!("\r\x1b[K🔍 正在深入探索代码...");
+                                let de_question = action_json
+                                    .get("arguments")
+                                    .and_then(|a| a.get("question"))
+                                    .and_then(|q| q.as_str())
+                                    .unwrap_or(question);
+                                let summary = action_json.get("arguments").and_then(|a| a.get("current_summary"));
 
-                            match de.execute(de_question, summary).await {
+                                match de.execute(de_question, summary).await {
+                                    Ok(result) => {
+                                        let result_str = serde_json::to_string(&result).unwrap_or_default();
+                                        messages.push(serde_json::json!({
+                                            "role": "user",
+                                            "content": format!("deep_explore 返回结果:\n{}", result_str),
+                                        }));
+                                    }
+                                    Err(e) => {
+                                        messages.push(serde_json::json!({
+                                            "role": "user",
+                                            "content": format!("deep_explore 执行失败: {}", e),
+                                        }));
+                                    }
+                                }
+                            } else {
+                                messages.push(serde_json::json!({
+                                    "role": "user",
+                                    "content": "deep_explore 当前不可用。可用工具为 fast_explore、execute_shell。",
+                                }));
+                            }
+                        }
+                        "execute_shell" => {
+                            let reasoning = action_json.get("reasoning").and_then(|v| v.as_str()).unwrap_or("");
+                            eprintln!("\r\x1b[K  \x1b[2m⬩ {}\x1b[0m",
+                                if reasoning.is_empty() { "执行 Shell 命令" } else { reasoning });
+                            let command = action_json
+                                .get("arguments")
+                                .and_then(|a| a.get("command"))
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("");
+                            match shell.execute(command).await {
                                 Ok(result) => {
                                     let result_str = serde_json::to_string(&result).unwrap_or_default();
+                                    let preview: String = result_str.chars().take(200).collect();
+                                    eprintln!("\r\x1b[K  \x1b[2m⚡ ok: {} → {}\x1b[0m", command.chars().take(80).collect::<String>(), preview);
                                     messages.push(serde_json::json!({
                                         "role": "user",
-                                        "content": format!("deep_explore 返回结果:\n{}", result_str),
+                                        "content": format!("execute_shell 返回结果:\n{}", result_str),
                                     }));
                                 }
                                 Err(e) => {
+                                    eprintln!("\r\x1b[K  \x1b[2m⚠ fail: {} | cmd: {}\x1b[0m", e, command);
                                     messages.push(serde_json::json!({
                                         "role": "user",
-                                        "content": format!("deep_explore 执行失败: {}", e),
+                                        "content": format!("execute_shell 执行失败: {} | 命令: {}", e, command),
                                     }));
                                 }
                             }
@@ -159,7 +219,7 @@ impl MainAgent {
                         _ => {
                             messages.push(serde_json::json!({
                                 "role": "user",
-                                "content": "未知工具。可用工具为 fast_explore 和 deep_explore。",
+                                "content": "未知工具。可用工具为 fast_explore、deep_explore、execute_shell。",
                             }));
                         }
                     }
@@ -188,7 +248,7 @@ impl MainAgent {
                 "properties": {
                     "action": {"type": "string", "enum": ["answer", "tool_call"]},
                     "final_response": {"type": "string"},
-                    "tool": {"type": "string", "enum": ["fast_explore", "deep_explore"]},
+                    "tool": {"type": "string", "enum": ["fast_explore", "deep_explore", "execute_shell"]},
                     "arguments": {"type": "object"}
                 },
                 "required": ["action"]
@@ -249,6 +309,7 @@ impl MainAgent {
         }
     }
 
+
     pub fn assemble_prompt() -> String {
         String::from(
             "你是探索者（Explore AI Agent），一个专业的代码库探索助手。\n\
@@ -256,7 +317,7 @@ impl MainAgent {
              \n\
              ## 可用工具\n\
              \n\
-             你可以调用以下两个工具。工具的具体输入输出格式由系统控制，以下是它们的能力描述和数据结构：\n\
+             你可以调用以下三个工具。工具的具体输入输出格式由系统控制，以下是它们的能力描述和数据结构：\n\
              \n\
              ### fast_explore — 快速扫描代码库\n\
              \n\
@@ -266,8 +327,8 @@ impl MainAgent {
              |:---|:---|\n\
              | 输入 | keywords（字符串数组）：2-5 个搜索关键词。你需要自己设计关键词——从用户问题中提取核心概念，中英文兼顾 |\n\
              | 输出 | matches（搜索结果）、key_findings（核心发现）、critical_files（关键文件列表）、confidence（置信度 0.0~1.0） |\n\
-             | 适用 | 首次探索、快速了解项目中有哪些相关模块、不确定方向时 |\n\
-             | 限制 | 单次扫描，只返回概要。如果结果不理想，可以调整关键词后再次调用 |\n\
+             | 适用 | 可选用。首次探索时快速了解项目中与问题相关的模块分布，帮你找到大方向 |\n\
+             | 限制 | 关键词匹配，覆盖面有限。可能遗漏重要代码，不可替代 deep_explore |\n\
              \n\
              输出示例：\n\
              {\"matches\": [...], \"key_findings\": \"回测模块在 backtest/engine.py 中实现\", \"critical_files\": [{\"path\": \"src/backtest/engine.py\", \"summary\": \"回测引擎核心\"}], \"confidence\": 0.8}\n\
@@ -280,20 +341,29 @@ impl MainAgent {
              |:---|:---|\n\
              | 输入 | question（字符串）：要调查的问题。current_summary（对象，可选）：已有的探索线索摘要 |\n\
              | 输出 | critical_files（相关文件及说明）、collected_evidence（代码证据列表，每条含 file、line、code_snippet、relevance）、missing_info（缺失信息） |\n\
-             | 适用 | fast_explore 指出关键文件但缺少细节、需要确认代码逻辑、追溯调用链 |\n\
-             | 限制 | 耗时较长（内部最多 75 次操作）。通常先 fast_explore 再 deep_explore |\n\
+             | 适用 | 主力探索工具。直接搜索代码库、阅读文件、追溯调用链、收集代码证据。任何时候需要深入调查都可以直接调用 |\n\
+             | 限制 | 耗时较长（内部最多 75 次操作）。deep_explore 已穷尽搜索，结果即为该问题可获得的全部证据，不应质疑或重试 |\n\
              \n\
              输出示例：\n\
              {\"critical_files\": [{\"path\": \"src/backtest/engine.py\", \"summary\": \"回测引擎核心\"}], \"collected_evidence\": [{\"file\": \"src/backtest/engine.py\", \"line\": \"142-158\", \"code_snippet\": \"def run_backtest...\", \"relevance\": \"回测主循环\"}], \"missing_info\": \"无\"}\n\
              \n\
-             ## 决策规则（严格遵守）\n\
+             ### execute_shell — 执行只读 Shell 命令\n\
              \n\
-             1. 任何关于代码库的问题，必须先调 fast_explore 获取数据，再回答。严禁在未探索的情况下猜测或说\"信息不足\"。\n\
-             2. fast_explore 返回线索后：信息不够 → 调 deep_explore 深入；信息够了 → 直接回答。\n\
-             3. 只有以下情况可以不调工具直接回答：\n\
-                - 纯问候（\"你好\"、\"谢谢\"、\"再见\"）\n\
-                - 追问刚才已探索过的话题（\"再详细说说\"）\n\
-             4. 严禁编造代码细节。探索之后数据仍不够，才可以说\"探索后未找到相关信息\"。\n\
+             当前 Shell：{shell_info}。可用命令：{shell_commands}（sed 禁止 -i）。\n\
+             grep 搜索代码、find 查文件、awk/sed 文本处理、wc 统计、管道组合过滤。\n\
+             \n\
+             | 项目 | 说明 |\n\
+             |:---|:---|\n\
+             | 输入 | command（字符串）：只读 Shell 命令 |\n\
+             | 输出 | success（是否成功）、output。失败时含 error |\n\
+             | 限制 | 禁止 > 重定向、tee、rm mv cp mkdir 等写入操作。管道命令必须在白名单内。output 最多 50KB（约 2000 行），超出丢弃 |\n\
+             \n\
+             ## 规则\n\
+             \n\
+             1. 任何关于代码库的问题，必须先探索再回答。严禁在未探索的情况下猜测或说\"信息不足\"。\n\
+             2. 纯问候（\"你好\"、\"谢谢\"、\"再见\"）或追问刚探索过的话题（\"再详细说说\"）可不调工具直接回答。\n\
+             3. 严禁编造代码细节。若探索后仍证据不足，如实告知。\n\
+             4. deep_explore 输出的 missing_info 字段不作为重试触发条件。missing_info 表示该次搜索未覆盖的盲区，不影响已收集证据的有效性。\n\
              \n\
              ## 通信协议\n\
              \n\
@@ -305,31 +375,59 @@ impl MainAgent {
              调用工具时：\n\
              {\"action\": \"tool_call\", \"tool\": \"fast_explore\", \"arguments\": {\"keywords\": [\"回测\", \"backtest\", \"引擎\"]}}\n\
              {\"action\": \"tool_call\", \"tool\": \"deep_explore\", \"arguments\": {\"question\": \"用户问题\", \"current_summary\": {...}}}\n\
+             {\"action\": \"tool_call\", \"tool\": \"execute_shell\", \"arguments\": {\"command\": \"find . -name '*.rs' | wc -l\"}, \"reasoning\": \"你的判断依据\"}}\n\
              \n\
              注意：只输出 JSON，不要包裹任何标记或解释文字。如果你的回答不符合 JSON 要求，系统将强制你重新回答，请务必按照通信协议规范的返回 JSON！",
         )
     }
 
-    /// v1.1 方法（保留兼容，待清理）
-    fn assemble_prompt_legacy() -> String {
-        String::from(
-            "你是探索者（Explore AI Agent），一个专业的代码库探索助手。基于系统提供的探索数据回答用户问题。\n\
-             \n\
-             系统会以结构化数据的形式向你提供对话上下文、用户问题和探索数据，请基于这些内容生成答案。\n\
-             \n\
-             ## 要求\n\
-             - 仅基于提供的探索数据回答，不要凭空编造\n\
-             - 如果探索数据不足以回答问题，如实告知用户\n\
-             - 回答专业、准确、简洁\n\
-             - 结合对话上下文理解多轮对话中的指代关系\n\
-             \n\
-             ## 输出格式\n\
-             直接输出答案，用 <final_response> 标签包裹。\n\
-             \n\
-             例如：\n\
-             <final_response>\n\
-             BooleanValidator 支持两个配置参数：required（默认 true）和 defaultValue。required 参数控制……\n\
-             </final_response>",
-        )
+    pub fn shell_info() -> String {
+        if cfg!(target_os = "windows") {
+            if has_usable_bash() {
+                "bash (Windows)".to_string()
+            } else {
+                "cmd.exe (Windows)".to_string()
+            }
+        } else {
+            "bash (Unix)".to_string()
+        }
+    }
+
+    pub fn shell_commands() -> String {
+        if Self::shell_info().starts_with("cmd") {
+            "type dir findstr".to_string()
+        } else {
+            "cat head tail less grep egrep fgrep find ls tree wc sort uniq cut tr awk sed file stat echo".to_string()
+        }
+    }
+}
+
+/// Check if a usable bash (with full Unix tools) is available.
+/// Mirrors the logic in execute_shell::discover_shell().
+fn has_usable_bash() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        // Same hardcoded paths as discover_shell()
+        let known = [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\msys64\usr\bin\bash.exe",
+        ];
+        if known.iter().any(|p| std::path::Path::new(p).exists()) {
+            return true;
+        }
+        // PATH scan: skip usr\bin bash (no grep/awk), accept bin/bash
+        if let Ok(path) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path) {
+                let p = dir.join("bash.exe");
+                if p.exists() && !p.to_string_lossy().contains("usr\\bin") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::path::Path::new("/bin/bash").exists()
     }
 }

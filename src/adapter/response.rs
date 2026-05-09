@@ -1,4 +1,5 @@
 use super::api_adapter::ApiAdapter;
+use super::reasoning::ReasoningChain;
 use super::types::{ApiMode, ToolCallInfo, UnifiedResponse};
 
 impl ApiAdapter {
@@ -60,7 +61,10 @@ impl ApiAdapter {
             }
         }
 
-        Ok(UnifiedResponse { text, tool_calls })
+        let chain = ReasoningChain::default_chain();
+        let (reasoning, text) = chain.extract(raw, text.as_deref());
+
+        Ok(UnifiedResponse { text, tool_calls, reasoning })
     }
 
     fn parse_responses_response(
@@ -122,6 +126,9 @@ impl ApiAdapter {
             Some(text_parts.join("\n"))
         };
 
-        Ok(UnifiedResponse { text, tool_calls })
+        let chain = ReasoningChain::default_chain();
+        let (reasoning, text) = chain.extract(raw, text.as_deref());
+
+        Ok(UnifiedResponse { text, tool_calls, reasoning })
     }
 }

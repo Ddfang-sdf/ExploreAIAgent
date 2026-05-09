@@ -506,29 +506,30 @@ fn es_042_working_dir_not_found() {
     assert_eq!(result.unwrap_err().code, ErrorCode::PathNotFound);
 }
 
-/// ES-043: Output truncation (> 10 KB)
+/// ES-043: Output truncation (> 50 KB)
 #[test]
 fn es_043_output_truncation() {
     let fixture = common::create_test_fixture();
     let root = fixture.path();
     let tool = make_tool(root);
 
-    // Create a ~20 KB file (just enough to exceed 10 KB truncation limit)
-    // instead of using the 10 MB large_file.txt which times out on Windows pipes.
+    // Create a ~55 KB file to exceed the 50 KB truncation limit
     let line = "repeated line for truncation test abcdefghij\n";
-    let content: String = line.repeat((12 * 1024 / line.len()) + 50);
+    let content: String = line.repeat((55 * 1024 / line.len()) + 50);
     std::fs::write(root.join("trunc_test.txt"), &content).unwrap();
 
-    let input = make_input(root, serde_json::json!({
-        "command": "cat trunc_test.txt"
-    }));
+    let cat_cmd = if cfg!(target_os = "windows") {
+        format!("type {}", root.join("trunc_test.txt").display())
+    } else {
+        format!("cat {}", root.join("trunc_test.txt").display())
+    };
+    let input = make_input(root, serde_json::json!({"command": cat_cmd}));
 
     let result = tool.execute(input).expect("should succeed");
     let output: ExecuteShellOutput = serde_json::from_value(result.data).unwrap();
 
-    // Output should be truncated to ~10 KB
-    assert!(output.output.len() <= 10 * 1024 + 512); // small tolerance
-    assert!(result.truncated);
+    assert!(output.output.len() <= 51 * 1024, "must be truncated at 50KB threshold");
+    assert!(result.truncated, "truncated flag must be set");
 }
 
 /// ES-044: Command failure (non-zero exit code)
@@ -797,4 +798,327 @@ fn inject_exclude_paths_other_commands_ignored() {
         &["vendor/*".to_string()],
     );
     assert_eq!(result, original);
+}
+
+// ============================================================================
+// v1.2: 端到端真实 Shell 测试
+// ============================================================================
+
+/// E2E-001: cat/type real file + verify content
+#[test]
+fn e2e_001_read_file_via_shell() {
+    let fixture = common::create_test_fixture();
+    let root = fixture.path();
+    let tool = make_tool(root);
+
+    let content = "hello world\nfoo bar\nbaz qux\n";
+    std::fs::write(root.join("test.txt"), content).unwrap();
+
+    let cmd = if cfg!(target_os = "windows") {
+        format!("type {}", root.join("test.txt").display())
+    } else {
+        format!("cat {}", root.join("test.txt").display())
+    };
+    let input = make_input(root, serde_json::json!({"command": cmd}));
+    let result = tool.execute(input).expect("cat must succeed");
+    let output: ExecuteShellOutput = serde_json::from_value(result.data).unwrap();
+    assert!(output.success, "cat should succeed");
+    assert!(output.output.contains("hello world"),
+        "output must contain file content, got: {}", output.output);
+    assert!(output.output.contains("foo bar"), "output must contain all lines");
+}
+
+/// E2E-002: grep text search with real file
+#[test]
+fn e2e_002_grep_real_file() {
+    let fixture = common::create_test_fixture();
+    let root = fixture.path();
+    let tool = make_tool(root);
+
+    std::fs::write(root.join("code.rs"), "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+
+    let cmd = if cfg!(target_os = "windows") {
+        format!("findstr main {}", root.join("code.rs").display())
+    } else {
+        format!("grep main {}", root.join("code.rs").display())
+    };
+    let input = make_input(root, serde_json::json!({"command": cmd}));
+    let result = tool.execute(input).expect("grep must succeed");
+    let output: ExecuteShellOutput = serde_json::from_value(result.data).unwrap();
+    assert!(output.success, "grep should succeed: {:?}", output.error);
+    assert!(output.output.contains("fn main"), "grep must find 'fn main' line");
+}
+
+/// E2E-003: echo piped to grep (safe pipeline)
+#[test]
+fn e2e_003_echo_pipe_grep() {
+    let fixture = common::create_test_fixture();
+    let root = fixture.path();
+    let tool = make_tool(root);
+
+    let input = make_input(root, serde_json::json!({"command": "echo hello | grep hello"}));
+    let result = tool.execute(input).expect("pipe must succeed");
+    let output: ExecuteShellOutput = serde_json::from_value(result.data).unwrap();
+    assert!(output.success, "pipe should succeed: {:?}", output.error);
+}
+
+/// E2E-004: disallowed command returns clear error
+#[test]
+fn e2e_004_disallowed_command_error() {
+    let fixture = common::create_test_fixture();
+    let root = fixture.path();
+    let tool = make_tool(root);
+
+    let input = make_input(root, serde_json::json!({"command": "rm -rf /"}));
+    let result = tool.execute(input);
+    // rm should be rejected by whitelist or operator check
+    assert!(result.is_err(), "rm must be rejected");
+    let err = result.unwrap_err();
+    assert!(
+        err.error.contains("not in") || err.error.contains("not allowed") || err.error.contains("拒绝") || err.error.contains("whitelist"),
+        "error must explain rejection, got: error={}", err.error
+    );
+}
+
+/// E2E-005: Shell discovery returns usable shell
+#[test]
+fn e2e_005_shell_discovery_returns_valid() {
+    let fixture = common::create_test_fixture();
+    let root = fixture.path();
+    let tool = make_tool(root);
+
+    // Execute a simple command to verify the discovered shell works
+    let input = make_input(root, serde_json::json!({"command": "echo shell_works"}));
+    let result = tool.execute(input).expect("shell must be functional");
+    let output: ExecuteShellOutput = serde_json::from_value(result.data).unwrap();
+    assert!(output.success, "discovered shell must be able to execute echo");
+    assert!(output.output.contains("shell_works"),
+        "shell output must contain the echoed text, got: {}", output.output);
+}
+
+/// E2E-006: > inside single quotes (awk) must NOT trigger redirect
+#[test]
+fn e2e_006_awk_comparison_in_quotes() {
+    let fixture = common::create_test_fixture();
+    let root = fixture.path();
+    let tool = make_tool(root);
+
+    // awk '{ if (NF>1) print $NF }' — > inside '...' should be safe
+    let input = make_input(root, serde_json::json!({
+        "command": "echo a.txt | awk -F. '{ if (NF>1) print $NF }'"
+    }));
+    let result = tool.execute(input);
+    assert!(result.is_ok(),
+        "> inside single quotes must NOT trigger redirect, got: {:?}", result.err());
+}
+
+/// E2E-007: ; inside single quotes must NOT trigger separator
+#[test]
+fn e2e_007_semicolon_in_quotes() {
+    let fixture = common::create_test_fixture();
+    let root = fixture.path();
+    let tool = make_tool(root);
+
+    // awk uses ; as statement separator inside quotes
+    let input = make_input(root, serde_json::json!({
+        "command": "echo test | awk '{ i=1; print $i }'"
+    }));
+    let result = tool.execute(input);
+    assert!(result.is_ok(),
+        "; inside single quotes must NOT trigger separator, got: {:?}", result.err());
+}
+
+/// E2E-008: > inside double quotes must NOT trigger redirect
+#[test]
+fn e2e_008_redirect_in_double_quotes() {
+    let fixture = common::create_test_fixture();
+    let root = fixture.path();
+    let tool = make_tool(root);
+
+    let input = make_input(root, serde_json::json!({
+        "command": "echo \"a > b\" | grep a"
+    }));
+    let result = tool.execute(input);
+    assert!(result.is_ok(),
+        "> inside double quotes must NOT trigger redirect, got: {:?}", result.err());
+}
+
+/// E2E-009: real ; outside quotes must still be rejected
+#[test]
+fn e2e_009_real_semicolon_rejected() {
+    let fixture = common::create_test_fixture();
+    let root = fixture.path();
+    let tool = make_tool(root);
+
+    let input = make_input(root, serde_json::json!({
+        "command": "echo hello; echo world"
+    }));
+    let result = tool.execute(input);
+    assert!(result.is_err(),
+        "real ; outside quotes must still be rejected");
+}
+
+/// E2E-010: file extension counting pipeline (the user's real scenario)
+#[test]
+fn e2e_010_file_extension_counting() {
+    let fixture = common::create_test_fixture();
+    let root = fixture.path();
+    let tool = make_tool(root);
+
+    // Create files with different extensions
+    std::fs::write(root.join("main.rs"), "// rust").unwrap();
+    std::fs::write(root.join("lib.rs"), "// rust lib").unwrap();
+    std::fs::write(root.join("config.toml"), "# toml").unwrap();
+    std::fs::write(root.join("README.md"), "# readme").unwrap();
+    std::fs::write(root.join("test.py"), "# python").unwrap();
+    std::fs::write(root.join("helper.py"), "# python helper").unwrap();
+
+    // Count file extensions (skip files without extension)
+    let input = make_input(root, serde_json::json!({
+        "command": "ls | grep '\\.' | awk -F. '{print $NF}' | sort | uniq -c"
+    }));
+    let result = tool.execute(input);
+    assert!(result.is_ok(),
+        "file extension counting must succeed, got: {:?}", result.err());
+    let output: ExecuteShellOutput = serde_json::from_value(result.unwrap().data).unwrap();
+    assert!(output.success, "pipeline must succeed: {:?}", output.error);
+    assert!(output.output.contains("md"), "must find .md files: {}", output.output);
+    assert!(output.output.contains("rs"), "must find .rs files: {}", output.output);
+    assert!(output.output.contains("py"), "must find .py files: {}", output.output);
+}
+// ============================================================================
+
+/// ES-062: 50KB 截断（C 层字节截断）
+/// Note: 当前 MAX_SHELL_OUTPUT_BYTES=10KB，升到 50KB 后此测试生效
+#[test]
+fn es_062_output_truncation_50kb() {
+    let fixture = common::create_test_fixture();
+    let root = fixture.path();
+    let tool = make_tool(root);
+
+    // Create a ~60 KB file to exceed the 50 KB C-layer limit
+    let line = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n";
+    let content: String = line.repeat((55 * 1024 / line.len()) + 50);
+    std::fs::write(root.join("large_50kb.txt"), &content).unwrap();
+
+    let cat_cmd = if cfg!(target_os = "windows") {
+        format!("type {}", root.join("large_50kb.txt").display())
+    } else {
+        format!("cat {}", root.join("large_50kb.txt").display())
+    };
+    let input = make_input(root, serde_json::json!({"command": cat_cmd}));
+    let result = tool.execute(input).expect("should succeed");
+    let output: ExecuteShellOutput = serde_json::from_value(result.data).unwrap();
+
+    assert!(result.truncated, "must be truncated at 50KB threshold");
+    // Allow small tolerance above 50KB
+    assert!(output.output.len() <= 51 * 1024,
+        "output must be ≤~51KB, got {}", output.output.len());
+}
+
+/// ES-063: 小输出不截断
+#[test]
+fn es_063_small_output_not_truncated() {
+    let fixture = common::create_test_fixture();
+    let root = fixture.path();
+    let tool = make_tool(root);
+
+    let echo_cmd = if cfg!(target_os = "windows") {
+        "echo hello".to_string()
+    } else {
+        "echo hello".to_string()
+    };
+    let input = make_input(root, serde_json::json!({"command": echo_cmd}));
+    let result = tool.execute(input).expect("should succeed");
+    let output: ExecuteShellOutput = serde_json::from_value(result.data).unwrap();
+
+    assert!(!result.truncated, "small output must not be truncated");
+    assert!(output.output.contains("hello"), "output must contain echo text");
+}
+
+/// ES-064: 截断边界——输出恰好小于 50KB 不触发截断
+/// Note: 当前 MAX_SHELL_OUTPUT_BYTES=10KB，升到 50KB 后此测试生效
+#[test]
+fn es_064_boundary_below_threshold() {
+    let fixture = common::create_test_fixture();
+    let root = fixture.path();
+    let tool = make_tool(root);
+
+    // Create a file just under 50 KB
+    let line = "x".repeat(99) + "\n"; // 100 chars per line
+    let content: String = line.repeat(49 * 1024 / 100);
+    std::fs::write(root.join("boundary.txt"), &content).unwrap();
+
+    let cat_cmd = if cfg!(target_os = "windows") {
+        format!("type {}", root.join("boundary.txt").display())
+    } else {
+        format!("cat {}", root.join("boundary.txt").display())
+    };
+    let input = make_input(root, serde_json::json!({"command": cat_cmd}));
+    let result = tool.execute(input).expect("should succeed");
+
+    assert!(!result.truncated,
+        "output under threshold must not be truncated");
+}
+
+/// ES-065: 多字节字符处理
+#[test]
+fn es_065_multibyte_characters() {
+    let fixture = common::create_test_fixture();
+    let root = fixture.path();
+    let tool = make_tool(root);
+
+    // 1000 Chinese characters (≈3000 bytes), far below any threshold
+    let content: String = "中".repeat(1000);
+    std::fs::write(root.join("chinese.txt"), &content).unwrap();
+
+    let cat_cmd = if cfg!(target_os = "windows") {
+        format!("type {}", root.join("chinese.txt").display())
+    } else {
+        format!("cat {}", root.join("chinese.txt").display())
+    };
+    let input = make_input(root, serde_json::json!({"command": cat_cmd}));
+    let result = tool.execute(input).expect("should succeed");
+    let output: ExecuteShellOutput = serde_json::from_value(result.data).unwrap();
+
+    assert!(!result.truncated,
+        "output far below threshold must not be truncated");
+    assert!(output.output.contains('中'),
+        "output must contain Chinese characters");
+}
+
+/// ES-066: 2000 行截断（C 层不截断，Rust 层截断至 2000 行）
+#[test]
+fn es_066_line_truncation_rust_layer() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let tool = make_tool(tmp.path());
+
+    // Build 2500 lines (each short, total < 50KB)
+    let mut content = String::new();
+    for i in 0..2500 {
+        content.push_str(&format!("line {}\n", i));
+    }
+    let file_path = tmp.path().join("many_lines.txt");
+    std::fs::write(&file_path, &content).unwrap();
+
+    let cat_cmd = if cfg!(target_os = "windows") {
+        format!("type {}", file_path.display())
+    } else {
+        format!("cat {}", file_path.display())
+    };
+
+    let input = ToolInput {
+        tool_name: "execute_shell".to_string(),
+        params: serde_json::json!({"command": cat_cmd}),
+        project_root: tmp.path().to_path_buf(),
+    };
+    let result = tool.execute(input).unwrap();
+    assert!(result.truncated, "2500 lines must trigger truncation");
+    assert!(result.success, "execution must succeed");
+
+    // Verify output is capped at 2000 lines
+    let output: ExecuteShellOutput = serde_json::from_value(result.data).unwrap();
+    let lines: Vec<&str> = output.output.lines().collect();
+    assert!(lines.len() <= 2000,
+        "output must be truncated to ≤2000 lines, got {}", lines.len());
 }

@@ -1,7 +1,8 @@
 ﻿use explore_ai_agent::adapter::api_adapter::{LlmStructuredClient, UnifiedResponse};
-use explore_ai_agent::context::exploration::{ExplorationContextTool, ExplorationRecord, ExplorationSummary};
+use explore_ai_agent::context::exploration::{ExplorationContextTool, ExplorationRecord};
 use explore_ai_agent::tools::fast_explore_tool::FastExploreTool;
 use explore_ai_agent::tools::registry::ToolRegistry;
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -21,6 +22,7 @@ impl MockQeClient {
     fn set_response(&self, resp: Result<UnifiedResponse, String>) {
         *self.response.lock().unwrap() = Some(resp);
     }
+    #[allow(dead_code)]
     fn call_count(&self) -> usize { *self.call_count.lock().unwrap() }
 }
 
@@ -40,6 +42,7 @@ fn make_qe_ok(confidence: f64) -> Result<UnifiedResponse, String> {
     Ok(UnifiedResponse {
         text: Some(format!(r#"{{"key_findings":"found","critical_files":[],"missing_info":"","confidence":{}}}"#, confidence)),
         tool_calls: vec![],
+        reasoning: None,
     })
 }
 
@@ -173,4 +176,51 @@ async fn fe_008_fast_explorer_failure() {
     // 防御性路径：FastExplorer 通过 ToolRegistry 执行，当前无法通过公开 API mock 其失败。
     // 当 ToolRegistry 注入 trait 后可测试 FastExplorer 失败的 Err 分支。
     assert!(result.is_ok(), "当前路径下 FastExplorer 成功，应返回 Ok");
+}
+
+// ============================================================================
+// Mtime sorting (newest files first)
+// ============================================================================
+
+#[tokio::test]
+async fn fe_mtime_sorting_newest_first() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+
+    // Create 3 files with same searchable content, different mtimes
+    let old = root.join("old.rs");
+    let mid = root.join("mid.rs");
+    let new = root.join("new.rs");
+
+    std::fs::write(&old, "fn search_target() {}").unwrap();
+    std::fs::write(&mid, "fn search_target() {}").unwrap();
+    std::fs::write(&new, "fn search_target() {}").unwrap();
+
+    // Set distinct mtimes via set_times (no extra crate needed)
+    let now = std::time::SystemTime::now();
+    let hour = std::time::Duration::from_secs(3600);
+    OpenOptions::new().write(true).open(&old).unwrap().set_modified(now - hour * 3).unwrap();
+    OpenOptions::new().write(true).open(&mid).unwrap().set_modified(now - hour * 2).unwrap();
+    OpenOptions::new().write(true).open(&new).unwrap().set_modified(now - hour).unwrap();
+
+    let registry = ToolRegistry::new(root.to_path_buf());
+    let ect = ExplorationContextTool::new("mtime-test".to_string());
+    let qe = MockQeClient::new();
+    qe.set_response(make_qe_ok(0.9));
+    let keywords: Vec<String> = vec!["search_target".to_string()];
+
+    let result = FastExploreTool::execute(&keywords, &registry, &ect, &qe).await;
+    assert!(result.is_ok(), "must succeed: {:?}", result.err());
+    let data = result.unwrap();
+
+    let matches = data.get("matches").and_then(|v| v.as_array())
+        .expect("must have matches array");
+    assert!(matches.len() >= 3, "must find all 3 files, got {}", matches.len());
+
+    // Verify newest files appear first
+    let first_file = matches[0].get("file").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        first_file.ends_with("new.rs"),
+        "newest file (new.rs) must be first, got: {}", first_file
+    );
 }

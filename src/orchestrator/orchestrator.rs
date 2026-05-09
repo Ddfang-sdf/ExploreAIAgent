@@ -1,24 +1,36 @@
 use std::sync::Arc;
 
 use crate::adapter::api_adapter::{ApiAdapter, LlmStructuredClient};
-use crate::agents::deep_explorer::{CollectedEvidence, DeepExplorer};
-use crate::agents::exploration_refiner::ExplorationRefinerAgent;
-use crate::agents::main_agent::MainAgent;
-use crate::agents::quality_evaluator::{
-    ExplorationAction, ExplorationQualityEvaluator, QualityEvaluatorInput,
-};
-use crate::agents::search_strategy::{SearchRoundRecord, SearchStrategyAgent};
-use crate::common::config::ExplorationConfig;
+use crate::agents::deep_explorer::CollectedEvidence;
+use crate::agents::quality_evaluator::{ExplorationAction, QualityEvaluatorInput};
+use crate::common::config::{DeepExplorerConfig, ExplorationConfig};
 use crate::context::exploration::{
     ExplorationContextTool, ExplorationRecord, ExplorationSummary,
 };
 use crate::conversation::manager::ConversationManager;
+use crate::agents::main_agent::ShellExecutor;
 use crate::tools::registry::ToolRegistry;
+
+pub struct ShellExec {
+    pub registry: Arc<ToolRegistry>,
+}
+
+#[async_trait::async_trait]
+impl ShellExecutor for ShellExec {
+    async fn execute(&self, command: &str) -> Result<serde_json::Value, String> {
+        let params = serde_json::json!({"command": command});
+        self.registry
+            .execute("execute_shell", params)
+            .map(|r| r.data)
+            .map_err(|e| e.error)
+    }
+}
 
 pub struct Orchestrator {
     adapter: Arc<ApiAdapter>,
     tool_registry: Arc<ToolRegistry>,
     _conversation_manager: ConversationManager,
+    pub de_config: DeepExplorerConfig,
 }
 
 impl Orchestrator {
@@ -26,11 +38,13 @@ impl Orchestrator {
         adapter: Arc<ApiAdapter>,
         tool_registry: Arc<ToolRegistry>,
         conversation_manager: ConversationManager,
+        de_config: DeepExplorerConfig,
     ) -> Self {
         Orchestrator {
             adapter,
             tool_registry,
             _conversation_manager: conversation_manager,
+            de_config,
         }
     }
 
@@ -40,8 +54,9 @@ impl Orchestrator {
         tool_registry: Arc<ToolRegistry>,
         conversation_manager: ConversationManager,
         _config: &ExplorationConfig,
+        de_config: &DeepExplorerConfig,
     ) -> Self {
-        Orchestrator::new(adapter, tool_registry, conversation_manager)
+        Orchestrator::new(adapter, tool_registry, conversation_manager, de_config.clone())
     }
 
     pub fn should_deep_explore(
@@ -130,7 +145,7 @@ impl Orchestrator {
         use crate::tools::fast_explore_tool::FastExploreTool;
         use std::sync::Arc;
 
-        let ect = Arc::new(exploration_context as *const ExplorationContextTool);
+        let _ect = Arc::new(exploration_context as *const ExplorationContextTool);
         // SAFETY: ECT outlives the async call (owned by CLI/main loop)
         let ect_ref: &'static ExplorationContextTool = unsafe { &*(exploration_context as *const ExplorationContextTool) };
 
@@ -153,6 +168,7 @@ impl Orchestrator {
             adapter: Arc<ApiAdapter>,
             registry: Arc<ToolRegistry>,
             ect: &'static ExplorationContextTool,
+            de_config: DeepExplorerConfig,
         }
 
         #[async_trait::async_trait]
@@ -172,7 +188,7 @@ impl Orchestrator {
                         confidence: 0.0,
                     },
                 };
-                let mut de = DeepExplorer::new();
+                let mut de = DeepExplorer::from_config(&self.de_config);
                 let result = de.execute(question, &current_summary,
                     self.adapter.as_ref(),
                     &self.registry,
@@ -187,10 +203,21 @@ impl Orchestrator {
             ect: ect_ref,
             qe_client: self.adapter.clone(),
         };
-        let de_exec = DeExec {
-            adapter: self.adapter.clone(),
+        let de_exec_holder;
+        let de_exec: Option<&dyn DeepExploreExecutor> = if self.de_config.enable {
+            de_exec_holder = DeExec {
+                adapter: self.adapter.clone(),
+                registry: self.tool_registry.clone(),
+                ect: ect_ref,
+                de_config: self.de_config.clone(),
+            };
+            Some(&de_exec_holder)
+        } else {
+            None
+        };
+
+        let shell_exec = ShellExec {
             registry: self.tool_registry.clone(),
-            ect: ect_ref,
         };
 
         let main_agent = MainAgent::new();
@@ -199,7 +226,8 @@ impl Orchestrator {
                 question,
                 "", // conversation_context — TODO: wire CM
                 &fe_exec,
-                &de_exec,
+                de_exec,
+                &shell_exec,
                 self.adapter.as_ref(),
             )
             .await?;

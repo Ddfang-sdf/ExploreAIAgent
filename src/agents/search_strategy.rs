@@ -48,7 +48,7 @@ impl SearchStrategyAgent {
     pub fn from_config(
         adapter: Arc<ApiAdapter>,
         tool_registry: Arc<ToolRegistry>,
-        config: &ExplorationConfig,
+        _config: &ExplorationConfig,
     ) -> Self {
         SearchStrategyAgent {
             max_rounds: 3, // v1.2: SSA deprecated, fast_explore uses single-shot execution

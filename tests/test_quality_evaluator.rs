@@ -1,6 +1,5 @@
 use explore_ai_agent::adapter::api_adapter::{LlmStructuredClient, UnifiedResponse};
 use explore_ai_agent::agents::quality_evaluator::*;
-use explore_ai_agent::context::exploration::ExplorationSummary;
 use std::sync::Mutex;
 
 struct MockLlmClient {
@@ -20,7 +19,7 @@ impl LlmStructuredClient for MockLlmClient {
 }
 
 fn mock_text(text: &str) -> Result<UnifiedResponse, String> {
-    Ok(UnifiedResponse { text: Some(text.to_string()), tool_calls: vec![] })
+    Ok(UnifiedResponse { text: Some(text.to_string()), tool_calls: vec![], reasoning: None })
 }
 
 fn make_qe_json(confidence: f64) -> String {
@@ -154,7 +153,7 @@ async fn qe_022_invalid_json() {
 async fn qe_023_empty_response() {
     let qe = ExplorationQualityEvaluator::new();
     let mock = MockLlmClient::new();
-    mock.set_response(Ok(UnifiedResponse { text: None, tool_calls: vec![] }));
+    mock.set_response(Ok(UnifiedResponse { text: None, tool_calls: vec![], reasoning: None }));
     let r = qe.evaluate("test", &make_exploration_data(), &mock).await;
     assert!(r.is_err());
 }

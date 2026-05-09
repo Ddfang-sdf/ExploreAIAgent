@@ -29,6 +29,7 @@ pub fn assemble_core(config: &AppConfig) -> Result<CoreModules, String> {
         registry.clone(),
         ConversationManager::new(ApiAdapter::new(ApiMode::Chat)),
         &config.exploration,
+        &config.deep_explorer,
     );
 
     Ok(CoreModules {

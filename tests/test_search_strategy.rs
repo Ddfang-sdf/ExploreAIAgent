@@ -42,6 +42,7 @@ impl MockRefinerClient {
         *self.response.lock().unwrap() = Some(resp);
     }
 
+    #[allow(dead_code)]
     fn call_count(&self) -> usize {
         *self.call_count.lock().unwrap()
     }
@@ -65,6 +66,7 @@ fn make_refiner_ok_response() -> Result<UnifiedResponse, String> {
     Ok(UnifiedResponse {
         text: Some(r#"{"key_findings":"精炼摘要","critical_files":[{"path":"src/main.rs","one_sentence_summary":"入口"}],"missing_info":"","confidence":0.8}"#.to_string()),
         tool_calls: vec![],
+        reasoning: None,
     })
 }
 

@@ -67,35 +67,51 @@ int whitelist_check(const char *command) {
     return 1;
 }
 
+/**
+ * Helper: advance past a quoted segment.
+ * Returns pointer after the closing quote, or end of string if unterminated.
+ */
+static const char *skip_quoted(const char *p, char quote) {
+    p++; /* skip opening quote */
+    while (*p && *p != quote) {
+        if (quote == '"' && *p == '\\' && *(p + 1)) p += 2; /* skip escaped char */
+        else p++;
+    }
+    if (*p == quote) p++; /* skip closing quote */
+    return p;
+}
+
 int operator_check(const char *command) {
     if (!command) return 1;
 
-    if (strstr(command, ">>")) return 1;
-    if (strstr(command, "$(")) return 1;
-    if (strchr(command, '`'))  return 1;
-    if (strchr(command, ';'))  return 1;
-    if (strstr(command, "&&")) return 1;
-    if (strstr(command, "||")) return 1;
-    if (strstr(command, "system(")) return 1;
-    if (strstr(command, "exec("))   return 1;
-
-    /* path traversal */
-    if (strstr(command, "../")) return 1;
-    if (strstr(command, "..\\")) return 1;
-
-    /* single > (not >>) */
-    {
-        const char *p = command;
-        while (*p) {
-            if (*p == '>') {
-                if (*(p + 1) == '>') { p += 2; continue; }
-                return 1;
-            }
-            p++;
+    const char *p = command;
+    while (*p) {
+        /* Skip quoted content */
+        if (*p == '\'' || *p == '"') {
+            p = skip_quoted(p, *p);
+            continue;
         }
+
+        /* Check dangerous patterns only outside quotes */
+        if (*p == '$' && *(p + 1) == '(') return 1;
+        if (*p == '`') return 1;
+        if (*p == ';') return 1;
+
+        if (*p == '>' && *(p + 1) == '>') { p += 2; continue; }
+        if (*p == '>') return 1;
+
+        if (*p == '&' && *(p + 1) == '&') { p += 2; continue; }
+        if (*p == '|' && *(p + 1) == '|') { p += 2; continue; }
+
+        if (strncmp(p, "system(", 7) == 0) return 1;
+        if (strncmp(p, "exec(", 5) == 0) return 1;
+        if (strncmp(p, "../", 3) == 0) return 1;
+        if (strncmp(p, "..\\", 3) == 0) return 1;
+
+        p++;
     }
 
-    /* background & (not &&) */
+    /* background & (trailing, outside quotes) */
     {
         size_t len = strlen(command);
         const char *trimmed = command + len;
@@ -162,7 +178,8 @@ static int pipe_check(const char *command) {
 #ifdef _WIN32
 
 static ShellResult execute_command_windows(const char *command, const char *working_dir,
-                                           int timeout_sec, size_t max_output_bytes) {
+                                           int timeout_sec, size_t max_output_bytes,
+                                           const char *shell_path) {
     ShellResult result;
     memset(&result, 0, sizeof(result));
 
@@ -196,7 +213,13 @@ static ShellResult execute_command_windows(const char *command, const char *work
     ZeroMemory(&pi, sizeof(pi));
 
     char cmd_line[8192];
-    snprintf(cmd_line, sizeof(cmd_line), "cmd.exe /C %s", command);
+    // Use detected shell: bash/sh/pwsh → -c,  cmd → /C
+    const char *flag = (strstr(shell_path, "cmd") || strstr(shell_path, "CMD")) ? "/C" : "-c";
+    if (strcmp(flag, "/C") == 0) {
+        snprintf(cmd_line, sizeof(cmd_line), "%s /C %s", shell_path, command);
+    } else {
+        snprintf(cmd_line, sizeof(cmd_line), "\"%s\" %s \"%s\"", shell_path, flag, command);
+    }
 
     BOOL proc_created = CreateProcessA(
         NULL, cmd_line, NULL, NULL, TRUE,
@@ -382,7 +405,8 @@ static double time_now(void) {
 }
 
 static ShellResult execute_command_unix(const char *command, const char *working_dir,
-                                        int timeout_sec, size_t max_output_bytes) {
+                                        int timeout_sec, size_t max_output_bytes,
+                                        const char *shell_path) {
     ShellResult result;
     memset(&result, 0, sizeof(result));
 
@@ -438,7 +462,7 @@ static ShellResult execute_command_unix(const char *command, const char *working
         free(home_copy);
         free(lang_copy);
 
-        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        execl(shell_path, shell_path, "-c", command, (char *)NULL);
         _exit(127);
     }
 
@@ -574,11 +598,12 @@ static ShellResult execute_command_unix(const char *command, const char *working
 #endif /* _WIN32 */
 
 ShellResult shell_execute(const char *command, const char *working_dir,
-                          int timeout_sec, size_t max_output_bytes) {
+                          int timeout_sec, size_t max_output_bytes,
+                          const char *shell_path) {
     ShellResult result;
     memset(&result, 0, sizeof(result));
 
-    if (!command || !working_dir) {
+    if (!command || !working_dir || !shell_path) {
         result.success = 0;
         result.error = strdup("Null argument");
         result.error_code = 3;
@@ -611,9 +636,9 @@ ShellResult shell_execute(const char *command, const char *working_dir,
     }
 
 #ifdef _WIN32
-    return execute_command_windows(command, working_dir, timeout_sec, max_output_bytes);
+    return execute_command_windows(command, working_dir, timeout_sec, max_output_bytes, shell_path);
 #else
-    return execute_command_unix(command, working_dir, timeout_sec, max_output_bytes);
+    return execute_command_unix(command, working_dir, timeout_sec, max_output_bytes, shell_path);
 #endif
 }
 

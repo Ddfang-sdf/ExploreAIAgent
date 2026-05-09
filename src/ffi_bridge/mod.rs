@@ -18,6 +18,7 @@ extern "C" {
         working_dir: *const c_char,
         timeout_sec: c_int,
         max_output_bytes: usize,
+        shell_path: *const c_char,
     ) -> ShellResultC;
 
     pub fn whitelist_check(command: *const c_char) -> c_int;
@@ -47,6 +48,7 @@ impl ShellExecutorFFI {
         working_dir: &str,
         timeout_sec: i32,
         max_output_bytes: usize,
+        shell_path: &str,
     ) -> Result<ShellOutput, ShellError> {
         let c_command = CString::new(command).map_err(|_| ShellError {
             error_code: 3,
@@ -58,12 +60,18 @@ impl ShellExecutorFFI {
             message: "Working directory contains null byte".to_string(),
         })?;
 
+        let c_shell_path = CString::new(shell_path).map_err(|_| ShellError {
+            error_code: 3,
+            message: "Shell path contains null byte".to_string(),
+        })?;
+
         let mut result = unsafe {
             shell_execute(
                 c_command.as_ptr(),
                 c_working_dir.as_ptr(),
                 timeout_sec as c_int,
                 max_output_bytes,
+                c_shell_path.as_ptr(),
             )
         };
 

@@ -40,10 +40,12 @@ typedef struct {
  * @param working_dir      命令执行目录（已校验的绝对路径）
  * @param timeout_sec      执行超时（秒）
  * @param max_output_bytes 输出截断上限（字节）
+ * @param shell_path       要使用的 Shell 路径（如 "C:\\Program Files\\Git\\bin\\bash.exe" 或 "/bin/sh"）
  * @return ShellResult     执行结果，调用方必须通过 shell_result_free 释放
  */
 ShellResult shell_execute(const char *command, const char *working_dir,
-                          int timeout_sec, size_t max_output_bytes);
+                          int timeout_sec, size_t max_output_bytes,
+                          const char *shell_path);
 
 /**
  * 白名单校验

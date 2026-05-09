@@ -22,6 +22,7 @@ pub struct ToolCallInfo {
 pub struct UnifiedResponse {
     pub text: Option<String>,
     pub tool_calls: Vec<ToolCallInfo>,
+    pub reasoning: Option<String>,
 }
 
 /// JSON Schema object used for structured output constraints.

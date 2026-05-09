@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::adapter::api_adapter::LlmToolClient;
 use crate::agents::exploration_refiner::ExplorationRefinerAgent;
 use crate::agents::quality_evaluator::ExplorationQualityEvaluator;
+use crate::agents::tool_result_refiner::ToolResultRefinerAgent;
 use crate::common::config::DeepExplorerConfig;
 use crate::context::exploration::{ExplorationContextTool, ExplorationSummary};
 use crate::tools::registry::ToolRegistry;
@@ -40,6 +41,8 @@ pub struct DeepExplorerResult {
 pub struct DeepExplorer {
     pub max_tool_calls: usize,
     loop_warning_threshold: usize,
+    token_threshold: usize,
+    token_target_ratio: f64,
     call_cache: HashSet<String>,
     consecutive_duplicates: usize,
 }
@@ -82,9 +85,12 @@ fn extract_json_object(text: &str) -> Option<String> {
 
 impl DeepExplorer {
     pub fn new() -> Self {
+        let defaults = DeepExplorerConfig::default();
         DeepExplorer {
             max_tool_calls: MAX_TOOL_CALLS,
             loop_warning_threshold: 3,
+            token_threshold: defaults.token_threshold,
+            token_target_ratio: defaults.token_target_ratio,
             call_cache: HashSet::new(),
             consecutive_duplicates: 0,
         }
@@ -94,6 +100,8 @@ impl DeepExplorer {
         DeepExplorer {
             max_tool_calls: config.max_tool_calls,
             loop_warning_threshold: config.loop_warning_threshold,
+            token_threshold: config.token_threshold,
+            token_target_ratio: config.token_target_ratio,
             call_cache: HashSet::new(),
             consecutive_duplicates: 0,
         }
@@ -265,7 +273,7 @@ impl DeepExplorer {
         let mut parse_retries: usize = 0;
         let mut degradation_count: usize = 0;
         const MAX_PARSE_RETRIES: usize = 2;
-        const MAX_CONTEXT_TOKENS: usize = 8000;
+        let max_context_tokens = self.token_threshold;
         const MAX_DEGRADATION: usize = 3;
 
         loop {
@@ -274,8 +282,8 @@ impl DeepExplorer {
             let total_chars: usize = messages.iter()
                 .map(|m| serde_json::to_string(m).unwrap_or_default().len())
                 .sum();
-            if total_chars / 4 > MAX_CONTEXT_TOKENS {
-                eprintln!("\r\x1b[K  🗜️ 上下文过大，正在压缩...");
+            if total_chars / 4 > max_context_tokens {
+                eprintln!("\r\x1b[K  \x1b[2m🗜️ 上下文过大，正在压缩...\x1b[0m");
 
                 // Step 1: Read data from ECT
                 let ect_summary = ect
@@ -294,9 +302,8 @@ impl DeepExplorer {
                     .collect();
 
                 // Step 2: Calculate target_token_limit per Section 6.2
-                let threshold = crate::context::exploration::EXPLORATION_TOKEN_THRESHOLD;
                 let target_token_limit =
-                    ((threshold as f64) * 0.10_f64).max(300.0) as usize;
+                    ((self.token_threshold as f64) * self.token_target_ratio).max(300.0) as usize;
 
                 // Step 3: Call Refiner (adapter implements LlmStructuredClient via LlmToolClient)
                 let refiner = ExplorationRefinerAgent::new();
@@ -313,8 +320,8 @@ impl DeepExplorer {
                 match refinement_result {
                     Ok(new_summary) => {
                         // Step 4: Write refined summary back to ECT
-                        if let Err(e) = ect.update_summary(new_summary) {
-                            eprintln!("\r\x1b[K  ⚠️ 上下文压缩失败");
+                        if let Err(_e) = ect.update_summary(new_summary) {
+                            eprintln!("\r\x1b[K  \x1b[2m⚠️ 上下文压缩失败\x1b[0m");
                         }
 
                         // Step 5: Rebuild messages from ECT
@@ -361,9 +368,9 @@ impl DeepExplorer {
                         let new_chars: usize = messages.iter()
                             .map(|m| serde_json::to_string(m).unwrap_or_default().len())
                             .sum();
-                        eprintln!("\r\x1b[K  📦 压缩完成（{} → {} 字符）", total_chars, new_chars);
+                        eprintln!("\r\x1b[K  \x1b[2m📦 压缩完成（{} → {} 字符）\x1b[0m", total_chars, new_chars);
                     }
-                    Err(refine_err) => {
+                    Err(_refine_err) => {
                         // Section 6.5 Step 5: Degradation
                         degradation_count += 1;
                         eprintln!(
@@ -372,7 +379,7 @@ impl DeepExplorer {
                         );
 
                         if degradation_count >= MAX_DEGRADATION {
-                            eprintln!("\r\x1b[K  ⚠️ 压缩连续失败，终止探索");
+                            eprintln!("\r\x1b[K  \x1b[2m⚠️ 压缩连续失败，终止探索\x1b[0m");
                             return Ok(DeepExplorerResult {
                                 critical_files: vec![],
                                 collected_evidence: vec![],
@@ -423,9 +430,21 @@ impl DeepExplorer {
 
             // Send with json_object constraint to force valid JSON output
             let rf = serde_json::json!({"type": "json_object"});
+
+            // ---- DEBUG: print token estimate ----
+            {
+                let total_chars: usize = messages.iter()
+                    .map(|m| serde_json::to_string(m).unwrap_or_default().len())
+                    .sum();
+                let est_tokens = total_chars / 4;
+                eprintln!("\r\x1b[K  \x1b[2mDE轮次{}: 消息数={} token≈{}\x1b[0m",
+                    tool_call_count + 1, messages.len(), est_tokens);
+            }
+
             let response = adapter
                 .call_llm_with_tools(&messages, &[], Some(&rf))
                 .await?;
+
 
             let text = match response.text {
                 Some(t) if !t.is_empty() => t,
@@ -486,9 +505,14 @@ impl DeepExplorer {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if action == "done" {
-                    eprintln!("\r\x1b[K  深度探索完成，共 {} 轮", tool_call_count + 1);
+                    eprintln!("\r\x1b[K  ✓ 探索完成 ({} 轮)", tool_call_count + 1);
                 } else {
-                    eprint!("\r\x1b[K  深度探索轮次 {}", tool_call_count + 1);
+                    let reasoning = action_json
+                        .get("reasoning")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    eprintln!("\r\x1b[K  \x1b[2m⬩ {}\x1b[0m",
+                        if reasoning.is_empty() { "…" } else { reasoning });
                 }
 
                 match action {
@@ -533,16 +557,17 @@ impl DeepExplorer {
                             },
                         );
 
-                        // v1.2: QE scoring per tool call (before result goes back to LLM)
+                        // v1.2: QE scoring per tool call — writes confidence to ECT only
                         let qe = ExplorationQualityEvaluator::new();
-                        if let Ok(qe_summary) = qe.evaluate(question, &tool_result, adapter).await {
+                        let _qe_result = qe.evaluate(question, &tool_result, adapter).await;
+                        if let Ok(ref qe_summary) = _qe_result {
                             let _ = ect.write_record(
                                 crate::context::exploration::ExplorationRecord::Summary {
                                     source: "ExplorationQualityEvaluator".to_string(),
                                     data: crate::context::exploration::ExplorationSummary {
-                                        key_findings: qe_summary.key_findings,
+                                        key_findings: qe_summary.key_findings.clone(),
                                         critical_files: vec![],
-                                        missing_info: qe_summary.missing_info,
+                                        missing_info: qe_summary.missing_info.clone(),
                                         confidence: qe_summary.confidence,
                                     },
                                     confidence: qe_summary.confidence,
@@ -551,21 +576,48 @@ impl DeepExplorer {
                             );
                         }
 
-                        let reasoning = action_json
-                            .get("reasoning")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
+                        // v1.3: TR skip threshold — if raw result fits in remaining
+                        // token budget (1000 total), skip TR to avoid LLM cost.
+                        let current_chars: usize = messages.iter()
+                            .map(|m| serde_json::to_string(m).unwrap_or_default().len())
+                            .sum();
+                        let raw_json = serde_json::to_string(&tool_result).unwrap_or_default();
+                        let raw_tokens = raw_json.len() / 4;
+                        let current_tokens = current_chars / 4;
+                        const TR_SKIP_BUDGET: usize = 1000;
 
-                        let result_feedback = format!(
-                            "工具 {} 执行结果:\n{}\n{}",
-                            tool_name,
-                            serde_json::to_string_pretty(&tool_result).unwrap_or_default(),
-                            if reasoning.is_empty() { "" } else { reasoning }
-                        );
+                        let result_feedback = if current_tokens + raw_tokens <= TR_SKIP_BUDGET {
+                            // Tool result is small enough — skip TR, use raw JSON directly
+                            format!("工具 {} 执行结果:\n{}", tool_name, raw_json)
+                        } else {
+                            // Tool result exceeds budget — use TR to refine
+                            let tr = ToolResultRefinerAgent::new();
+                            let tr_result = tr.refine(question, &tool_name, &tool_result, adapter).await;
+                            match &tr_result {
+                                Ok(refined) => {
+                                    format!("工具 {} 结果: {}", tool_name, refined.summary)
+                                }
+                                Err(_) => {
+                                    let truncated: String = raw_json.chars().take(500).collect();
+                                    format!("工具 {} 执行结果 (截断):\n{}...", tool_name, truncated)
+                                }
+                            }
+                        };
                         messages.push(serde_json::json!({
                             "role": "user",
                             "content": result_feedback,
                         }));
+
+                        // Trim old tool results: ECT holds full history,
+                        // LLM only needs last 2 rounds for continuity.
+                        if messages.len() > 5 {
+                            let system = messages.remove(0);
+                            let keep_start = messages.len().saturating_sub(4);
+                            let kept: Vec<_> = messages.drain(keep_start..).collect();
+                            messages.clear();
+                            messages.push(system);
+                            messages.extend(kept);
+                        }
 
                         tool_call_count += 1;
                     }
@@ -576,7 +628,7 @@ impl DeepExplorer {
                             .ok_or("action=done missing 'result' field")?;
                         let result: DeepExplorerResult = serde_json::from_value(result_value.clone())
                             .map_err(|e| format!("Failed to parse exploration result: {}", e))?;
-                        eprintln!("  深度探索完成：{} 次工具调用，耗时 {:.1}s", tool_call_count, t0.elapsed().as_secs_f64());
+                        eprintln!("\r\x1b[K  \x1b[2mDE完成：{} 次工具调用，耗时 {:.1}s\x1b[0m", tool_call_count, t0.elapsed().as_secs_f64());
                         return Ok(result);
                     }
 

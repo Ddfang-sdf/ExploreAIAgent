@@ -42,6 +42,7 @@ fn mock_text_response(text: &str) -> Result<UnifiedResponse, String> {
     Ok(UnifiedResponse {
         text: Some(text.to_string()),
         tool_calls: vec![],
+        reasoning: None,
     })
 }
 
@@ -245,6 +246,7 @@ async fn cr_013_empty_response_returns_err() {
     mock.set_response(Ok(UnifiedResponse {
         text: None,
         tool_calls: vec![],
+        reasoning: None,
     }));
 
     let result = agent

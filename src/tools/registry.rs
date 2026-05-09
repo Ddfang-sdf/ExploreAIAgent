@@ -20,6 +20,8 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    pub fn project_root(&self) -> &PathBuf { &self.project_root }
+
     pub fn new(project_root: PathBuf) -> Self {
         let mut registry = ToolRegistry {
             tools: HashMap::new(),

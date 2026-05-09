@@ -125,18 +125,32 @@ impl Default for ExplorationConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeepExplorerConfig {
+    #[serde(default = "default_enable")]
+    pub enable: bool,
+
     #[serde(default = "default_max_tool_calls")]
     pub max_tool_calls: usize,
 
     #[serde(default = "default_loop_warning_threshold")]
     pub loop_warning_threshold: usize,
+
+    #[serde(default = "default_token_threshold")]
+    pub token_threshold: usize,
+
+    #[serde(default = "default_token_target_ratio")]
+    pub token_target_ratio: f64,
 }
+
+fn default_enable() -> bool { true }
 
 impl Default for DeepExplorerConfig {
     fn default() -> Self {
         DeepExplorerConfig {
+            enable: true,
             max_tool_calls: default_max_tool_calls(),
             loop_warning_threshold: default_loop_warning_threshold(),
+            token_threshold: default_token_threshold(),
+            token_target_ratio: default_token_target_ratio(),
         }
     }
 }

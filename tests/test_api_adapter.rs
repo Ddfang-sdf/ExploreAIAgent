@@ -474,6 +474,7 @@ fn unified_response_text_only() {
     let response = UnifiedResponse {
         text: Some("Hello".to_string()),
         tool_calls: vec![],
+        reasoning: None,
     };
     assert!(response.tool_calls.is_empty());
     assert_eq!(response.text.unwrap(), "Hello");
@@ -493,6 +494,7 @@ fn unified_response_with_tool_calls() {
                 arguments: serde_json::json!({"file": "src/main.rs"}),
             },
         ],
+        reasoning: None,
     };
     assert_eq!(response.tool_calls.len(), 2);
 }

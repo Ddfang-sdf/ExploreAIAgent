@@ -55,6 +55,7 @@ fn mock_text_response(json: &str) -> Result<UnifiedResponse, String> {
     Ok(UnifiedResponse {
         text: Some(json.to_string()),
         tool_calls: vec![],
+        reasoning: None,
     })
 }
 
@@ -62,6 +63,7 @@ fn mock_empty_response() -> Result<UnifiedResponse, String> {
     Ok(UnifiedResponse {
         text: None,
         tool_calls: vec![],
+        reasoning: None,
     })
 }
 
@@ -734,6 +736,7 @@ async fn er_047_unexpected_tool_calls_returns_err() {
             name: "read_file".to_string(),
             arguments: serde_json::json!({"file": "test.rs"}),
         }],
+        reasoning: None,
     }));
 
     let result = agent
