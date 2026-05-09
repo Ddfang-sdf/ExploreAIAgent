@@ -9,6 +9,7 @@ use crate::conversation::manager::ConversationManager;
 use crate::orchestrator::orchestrator::Orchestrator;
 use crate::tools::registry::ToolRegistry;
 
+#[derive(Clone)]
 pub struct CoreModules {
     pub adapter: Arc<ApiAdapter>,
     pub registry: Arc<ToolRegistry>,

@@ -1,4 +1,12 @@
+use tokio::sync::mpsc;
 use crate::adapter::api_adapter::{LlmStructuredClient, LlmToolClient};
+
+#[derive(Debug, Clone)]
+pub enum SseEvent { Thinking(String), Answer(String), Done }
+pub static SSE_TX: std::sync::Mutex<Option<mpsc::UnboundedSender<SseEvent>>> = std::sync::Mutex::new(None);
+pub fn sse_enable() -> mpsc::UnboundedReceiver<SseEvent> { let (tx, rx) = mpsc::unbounded_channel(); *SSE_TX.lock().unwrap() = Some(tx); rx }
+pub fn sse_disable() { *SSE_TX.lock().unwrap() = None; }
+pub fn sse_send(e: SseEvent) { if let Some(tx) = SSE_TX.lock().unwrap().as_ref() { let _ = tx.send(e); } }
 
 // ============================================================================
 // v1.2: Trait definitions for dependency injection
@@ -133,6 +141,7 @@ impl MainAgent {
                     match tool {
                         "fast_explore" => {
                             eprintln!("\r\x1b[K🔍 正在搜索代码库...");
+                            sse_send(SseEvent::Thinking("🔍 正在搜索代码库...".into()));
                             let keywords: Vec<String> = action_json
                                 .get("arguments")
                                 .and_then(|a| a.get("keywords"))
@@ -159,6 +168,7 @@ impl MainAgent {
                         "deep_explore" => {
                             if let Some(de) = de {
                                 eprintln!("\r\x1b[K🔍 正在深入探索代码...");
+                                sse_send(SseEvent::Thinking("🔍 正在深入探索代码...".into()));
                                 let de_question = action_json
                                     .get("arguments")
                                     .and_then(|a| a.get("question"))
@@ -190,8 +200,9 @@ impl MainAgent {
                         }
                         "execute_shell" => {
                             let reasoning = action_json.get("reasoning").and_then(|v| v.as_str()).unwrap_or("");
-                            eprintln!("\r\x1b[K  \x1b[2m⬩ {}\x1b[0m",
-                                if reasoning.is_empty() { "执行 Shell 命令" } else { reasoning });
+                            let thinking = if reasoning.is_empty() { "执行 Shell 命令".to_string() } else { reasoning.to_string() };
+                            eprintln!("\r\x1b[K  \x1b[2m⬩ {}\x1b[0m", thinking);
+                            sse_send(SseEvent::Thinking(thinking));
                             let command = action_json
                                 .get("arguments")
                                 .and_then(|a| a.get("command"))

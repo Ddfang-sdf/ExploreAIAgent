@@ -511,8 +511,11 @@ impl DeepExplorer {
                         .get("reasoning")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    eprintln!("\r\x1b[K  \x1b[2m⬩ {}\x1b[0m",
-                        if reasoning.is_empty() { "…" } else { reasoning });
+                    let text = if reasoning.is_empty() { "…".to_string() } else { reasoning.to_string() };
+                    eprintln!("\r\x1b[K  \x1b[2m⬩ {}\x1b[0m", text);
+                    crate::agents::main_agent::sse_send(
+                        crate::agents::main_agent::SseEvent::Thinking(format!("⬩ 深度探索: {}", text))
+                    );
                 }
 
                 match action {

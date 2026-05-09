@@ -30,6 +30,7 @@ pub trait LlmToolClient: LlmStructuredClient {
     ) -> Result<UnifiedResponse, String>;
 }
 
+#[derive(Clone)]
 pub struct ApiAdapter {
     pub(crate) api_mode: ApiMode,
     pub(crate) max_retries: usize,

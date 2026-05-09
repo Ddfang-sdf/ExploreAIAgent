@@ -29,6 +29,7 @@ pub struct ConversationContext {
     pub metadata: ConversationMetadata,
 }
 
+#[derive(Clone)]
 pub struct ConversationContextTool {
     context: ConversationContext,
     round_threshold: usize,

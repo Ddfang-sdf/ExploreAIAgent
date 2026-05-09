@@ -26,6 +26,7 @@ impl ShellExecutor for ShellExec {
     }
 }
 
+#[derive(Clone)]
 pub struct Orchestrator {
     adapter: Arc<ApiAdapter>,
     tool_registry: Arc<ToolRegistry>,

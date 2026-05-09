@@ -18,6 +18,8 @@ async-trait = "0.1"
 minreq = { version = "2", features = ["https-rustls"] }
 clap = { version = "4", features = ["derive"] }
 axum = "0.7"
+tokio-stream = "0.1"
+tower-http = { version = "0.5", features = ["cors"] }
 tower = "0.4"
 
 [build-dependencies]

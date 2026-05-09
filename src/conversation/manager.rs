@@ -12,6 +12,7 @@ pub struct ConversationOutput {
     pub recent_history: Vec<crate::context::conversation::ConversationRecord>,
 }
 
+#[derive(Clone)]
 pub struct ConversationManager {
     sessions: std::collections::HashMap<String, ConversationContextTool>,
     _adapter: ApiAdapter,
