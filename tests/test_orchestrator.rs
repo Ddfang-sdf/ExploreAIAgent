@@ -28,7 +28,7 @@ fn make_ect() -> ExplorationContextTool {
 async fn or_001_normal_flow() {
     let orch = make_orchestrator();
     let mut ect = make_ect();
-    let result = orch.run("你好", &mut ect).await;
+    let result = orch.run("你好", "", Arc::new(ect)).await;
     // stub: 实现后 MainAgent 直接 answer → Orchestrator 返回答案
     assert!(result.is_err(), "stub 占位，实现后应返回 Ok(答案)");
 }
@@ -38,7 +38,7 @@ async fn or_001_normal_flow() {
 async fn or_002_main_agent_failure() {
     let orch = make_orchestrator();
     let mut ect = make_ect();
-    let result = orch.run("test", &mut ect).await;
+    let result = orch.run("test", "", Arc::new(ect)).await;
     // stub: MainAgent::run() 返回 Err → Orchestrator 透传错误
     assert!(result.is_err(), "stub 占位，实现后 MainAgent 失败应返回 Err");
 }
@@ -48,7 +48,7 @@ async fn or_002_main_agent_failure() {
 async fn or_003_cm_save_failure_does_not_block() {
     let orch = make_orchestrator();
     let mut ect = make_ect();
-    let result = orch.run("test", &mut ect).await;
+    let result = orch.run("test", "", Arc::new(ect)).await;
     // stub: MainAgent 正常，CM 保存失败 → run() 仍返回 Ok
     assert!(result.is_err(), "stub 占位，实现后 CM 失败不阻塞答案返回");
 }

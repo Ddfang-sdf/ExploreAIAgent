@@ -45,10 +45,14 @@ pub async fn run_cli_with_io<R: BufRead, W: Write>(
     reader: R,
     mut writer: W,
 ) -> Result<(), String> {
-    let core = assemble_core(config)?;
+    let mut core = assemble_core(config)?;
+    let session_id = "cli-session";
 
-    let mut ect = ExplorationContextTool::new("cli-session".to_string());
+    core.conversation_manager.init_session(session_id);
+
+    let mut ect = ExplorationContextTool::new(session_id.to_string());
     ect.configure(&config.exploration, &config.context);
+    let ect = Arc::new(ect);
 
     let mut line = String::new();
     let mut reader = reader;
@@ -64,18 +68,19 @@ pub async fn run_cli_with_io<R: BufRead, W: Write>(
         reader.read_line(&mut line).map_err(|e| e.to_string())?;
         let input = line.trim().to_string();
 
-        if input.is_empty() {
-            continue;
-        }
-        if input == "/exit" || input == "/quit" || input == "exit" || input == "quit" {
-            break;
-        }
+        if input.is_empty() { continue; }
+        if input == "/exit" || input == "/quit" || input == "exit" || input == "quit" { break; }
+
+        let ctx = core.conversation_manager.get_context(session_id)
+            .map(|c| c.conversation_summary).unwrap_or_default();
 
         let t0 = std::time::Instant::now();
-        match core.orchestrator.run(&input, &ect).await {
+        match core.orchestrator.run(&input, &ctx, ect.clone()).await {
             Ok(answer) => {
                 let elapsed = t0.elapsed().as_secs_f64();
                 eprintln!("\r\x1b[K✅ 回答完成 ({:.1}s)", elapsed);
+                let summary: String = answer.chars().take(200).collect();
+                let _ = core.conversation_manager.save_conversation(session_id, &input, &summary);
                 writeln!(writer, "{}", answer).map_err(|e| e.to_string())?;
             }
             Err(e) => {

@@ -7,7 +7,7 @@ use crate::context::exploration::ExplorationContextTool;
 use crate::orchestrator::orchestrator::Orchestrator;
 use crate::conversation::manager::ConversationManager;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 // ============================================================================
 // Data structures (design doc section 3.5)
@@ -48,7 +48,7 @@ impl ChatResponse {
 pub struct AppState {
     pub orchestrator: Orchestrator,
     pub conversation_manager: ConversationManager,
-    pub sessions: Mutex<HashMap<String, ExplorationContextTool>>,
+    pub sessions: Mutex<HashMap<String, Arc<ExplorationContextTool>>>,
     pub config: AppConfig,
 }
 
@@ -90,11 +90,11 @@ pub async fn handle_chat_request(
     let ect = sessions.entry(session_id.clone()).or_insert_with(|| {
         let mut ect = ExplorationContextTool::new(session_id.clone());
         ect.configure(&state.config.exploration, &state.config.context);
-        ect
-    });
+        Arc::new(ect)
+    }).clone(); // clone Arc for this request, keep original in map
 
     // Step 4: call Orchestrator
-    match state.orchestrator.run(&body.question, ect).await {
+    match state.orchestrator.run(&body.question, "", ect).await {
         Ok(answer) => ChatResponse {
             code: 0,
             session_id,
