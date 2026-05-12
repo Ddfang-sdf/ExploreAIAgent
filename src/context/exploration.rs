@@ -7,10 +7,11 @@ use crate::common::error::{ErrorCode, ToolError};
 use crate::common::models::{ToolInput, ToolOutput};
 use crate::tools::executor::ToolExecutor;
 
-pub const EXPLORATION_TOKEN_THRESHOLD: usize = 5500;
+pub const EXPLORATION_TOKEN_THRESHOLD: usize = 12000;
 pub const EXPLORATION_TOKEN_TARGET_RATIO: f64 = 0.70;
 pub const MIN_REMAINING_RECORDS: usize = 5;
 pub const RECORD_MAX_CHARS: usize = 8000;
+pub const DEFAULT_REFINER_SUMMARY_RATIO: f64 = 0.25;
 
 // ---- data structures ----
 
@@ -108,6 +109,7 @@ pub struct ExplorationContextTool {
     backup_summary: Mutex<Option<ExplorationSummary>>,
     token_threshold: usize,
     token_target_ratio: f64,
+    refiner_summary_ratio: f64,
     min_remaining_records: usize,
     record_max_chars: usize,
 }
@@ -128,6 +130,7 @@ impl ExplorationContextTool {
             backup_summary: Mutex::new(None),
             token_threshold: EXPLORATION_TOKEN_THRESHOLD,
             token_target_ratio: EXPLORATION_TOKEN_TARGET_RATIO,
+            refiner_summary_ratio: DEFAULT_REFINER_SUMMARY_RATIO,
             min_remaining_records: MIN_REMAINING_RECORDS,
             record_max_chars: RECORD_MAX_CHARS,
         }
@@ -140,8 +143,19 @@ impl ExplorationContextTool {
     ) {
         self.token_threshold = exploration.token_threshold;
         self.token_target_ratio = exploration.token_target_ratio;
+        self.refiner_summary_ratio = exploration.refiner_summary_token_ratio;
         self.min_remaining_records = context.min_remaining_records;
         self.record_max_chars = context.record_max_chars;
+    }
+
+    /// Token threshold at which compression is triggered.
+    pub fn token_threshold(&self) -> usize {
+        self.token_threshold
+    }
+
+    /// Ratio of token_threshold to target when compressing summaries (e.g. 0.25 → 2000 tokens at 8000 threshold).
+    pub fn refiner_summary_ratio(&self) -> f64 {
+        self.refiner_summary_ratio
     }
 
     // ---- token estimation ----

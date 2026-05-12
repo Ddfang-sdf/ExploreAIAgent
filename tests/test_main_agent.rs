@@ -2,7 +2,8 @@ use explore_ai_agent::adapter::api_adapter::{LlmStructuredClient, LlmToolClient,
 use explore_ai_agent::agents::main_agent::{
     DeepExploreExecutor, FastExploreExecutor, MainAgent, ShellExecutor,
 };
-use std::sync::Mutex;
+use explore_ai_agent::context::exploration::ExplorationContextTool;
+use std::sync::{Arc, Mutex};
 
 // ============================================================================
 // Mock LLM client — returns pre-configured JSON responses in sequence
@@ -203,15 +204,15 @@ fn ma_012_prompt_has_execute_shell_heading() {
 #[test]
 fn ma_013_prompt_has_json_protocol() {
     let prompt = MainAgent::assemble_prompt();
-    assert!(prompt.contains(r#"{"action":"#), "应含 JSON 通信协议示例");
+    // Now uses {tool_examples} placeholder — verify it exists
+    assert!(prompt.contains("{tool_examples}"), "应含 tool_examples 占位符");
 }
 
 #[test]
 fn ma_014_prompt_has_all_three_tool_names() {
     let prompt = MainAgent::assemble_prompt();
-    assert!(prompt.contains(r#""fast_explore""#), "应含 fast_explore");
-    assert!(prompt.contains(r#""deep_explore""#), "应含 deep_explore");
-    assert!(prompt.contains(r#""execute_shell""#), "应含 execute_shell");
+    // Now uses {tool_names} placeholder — verify it exists
+    assert!(prompt.contains("{tool_names}"), "应含 tool_names 占位符");
 }
 
 // ============================================================================
@@ -262,7 +263,7 @@ async fn ma_020_direct_answer_no_tools() {
     let de = MockDeepExplore::new(mock_de_result());
     let shell = MockShellExecute::new(mock_shell_result());
 
-    let result = agent.run("你好", "", &fe, Some(&de), &shell, &mock).await;
+    let result = agent.run("你好", "", Some(&fe), Some(&de), &shell, &mock, Arc::new(ExplorationContextTool::new("test-ma".into())), false, 500, 10240, None).await;
     assert!(result.is_ok(), "直接回答应返回 Ok，实际: {:?}", result.err());
 }
 
@@ -277,7 +278,7 @@ async fn ma_021_fast_explore_then_answer() {
     let de = MockDeepExplore::new(mock_de_result());
     let shell = MockShellExecute::new(mock_shell_result());
 
-    let result = agent.run("test", "", &fe, Some(&de), &shell, &mock).await;
+    let result = agent.run("test", "", Some(&fe), Some(&de), &shell, &mock, Arc::new(ExplorationContextTool::new("test-ma".into())), false, 500, 10240, None).await;
     assert!(result.is_ok(), "应返回 Ok，实际: {:?}", result.err());
 }
 
@@ -292,7 +293,7 @@ async fn ma_022_deep_explore_then_answer() {
     let de = MockDeepExplore::new(mock_de_result());
     let shell = MockShellExecute::new(mock_shell_result());
 
-    let result = agent.run("test", "", &fe, Some(&de), &shell, &mock).await;
+    let result = agent.run("test", "", Some(&fe), Some(&de), &shell, &mock, Arc::new(ExplorationContextTool::new("test-ma".into())), false, 500, 10240, None).await;
     assert!(result.is_ok(), "应返回 Ok，实际: {:?}", result.err());
 }
 
@@ -309,7 +310,7 @@ async fn ma_023_multi_fast_explore_iteration() {
     let de = MockDeepExplore::new(mock_de_result());
     let shell = MockShellExecute::new(mock_shell_result());
 
-    let _ = agent.run("test", "", &fe, Some(&de), &shell, &mock).await;
+    let _ = agent.run("test", "", Some(&fe), Some(&de), &shell, &mock, Arc::new(ExplorationContextTool::new("test-ma".into())), false, 500, 10240, None).await;
     assert!(true, "stub 占位");
 }
 
@@ -325,7 +326,7 @@ async fn ma_024_fast_explore_then_de() {
     let de = MockDeepExplore::new(mock_de_result());
     let shell = MockShellExecute::new(mock_shell_result());
 
-    let _ = agent.run("test", "", &fe, Some(&de), &shell, &mock).await;
+    let _ = agent.run("test", "", Some(&fe), Some(&de), &shell, &mock, Arc::new(ExplorationContextTool::new("test-ma".into())), false, 500, 10240, None).await;
     assert!(true, "stub 占位");
 }
 
@@ -345,7 +346,7 @@ async fn ma_025_fe_failure_then_de() {
     let de = MockDeepExplore::new(mock_de_result());
     let shell = MockShellExecute::new(mock_shell_result());
 
-    let result = agent.run("test", "", &fe, Some(&de), &shell, &mock).await;
+    let result = agent.run("test", "", Some(&fe), Some(&de), &shell, &mock, Arc::new(ExplorationContextTool::new("test-ma".into())), false, 500, 10240, None).await;
     assert!(result.is_ok(), "应返回 Ok，实际: {:?}", result.err());
 }
 
@@ -360,7 +361,7 @@ async fn ma_026_json_parse_retry_success() {
     let de = MockDeepExplore::new(mock_de_result());
     let shell = MockShellExecute::new(mock_shell_result());
 
-    let result = agent.run("test", "", &fe, Some(&de), &shell, &mock).await;
+    let result = agent.run("test", "", Some(&fe), Some(&de), &shell, &mock, Arc::new(ExplorationContextTool::new("test-ma".into())), false, 500, 10240, None).await;
     assert!(result.is_ok(), "应返回 Ok，实际: {:?}", result.err());
 }
 
@@ -376,7 +377,7 @@ async fn ma_027_json_retry_exhausted() {
     let de = MockDeepExplore::new(mock_de_result());
     let shell = MockShellExecute::new(mock_shell_result());
 
-    let result = agent.run("test", "", &fe, Some(&de), &shell, &mock).await;
+    let result = agent.run("test", "", Some(&fe), Some(&de), &shell, &mock, Arc::new(ExplorationContextTool::new("test-ma".into())), false, 500, 10240, None).await;
     assert!(result.is_err(), "应返回 Err，实际: {:?}", result.ok());
 }
 
@@ -391,7 +392,7 @@ async fn ma_028_unknown_tool_name() {
     let de = MockDeepExplore::new(mock_de_result());
     let shell = MockShellExecute::new(mock_shell_result());
 
-    let result = agent.run("test", "", &fe, Some(&de), &shell, &mock).await;
+    let result = agent.run("test", "", Some(&fe), Some(&de), &shell, &mock, Arc::new(ExplorationContextTool::new("test-ma".into())), false, 500, 10240, None).await;
     assert!(result.is_ok(), "应返回 Ok，实际: {:?}", result.err());
 }
 
@@ -405,7 +406,7 @@ async fn ma_029_llm_client_failure() {
     let de = MockDeepExplore::new(mock_de_result());
     let shell = MockShellExecute::new(mock_shell_result());
 
-    let result = agent.run("test", "", &fe, Some(&de), &shell, &mock).await;
+    let result = agent.run("test", "", Some(&fe), Some(&de), &shell, &mock, Arc::new(ExplorationContextTool::new("test-ma".into())), false, 500, 10240, None).await;
     assert!(result.is_err(), "应返回 Err，实际: {:?}", result.ok());
 }
 
@@ -421,7 +422,7 @@ async fn ma_030_de_failure_then_fe() {
     let de = MockDeepExplore::new(Err("deep explore failed".to_string()));
     let shell = MockShellExecute::new(mock_shell_result());
 
-    let result = agent.run("test", "", &fe, Some(&de), &shell, &mock).await;
+    let result = agent.run("test", "", Some(&fe), Some(&de), &shell, &mock, Arc::new(ExplorationContextTool::new("test-ma".into())), false, 500, 10240, None).await;
     assert!(result.is_ok(), "应返回 Ok，实际: {:?}", result.err());
 }
 
@@ -442,7 +443,7 @@ async fn ma_031_context_truncation() {
     let de = MockDeepExplore::new(mock_de_result());
     let shell = MockShellExecute::new(mock_shell_result());
 
-    let result = agent.run("test", "", &fe, Some(&de), &shell, &mock).await;
+    let result = agent.run("test", "", Some(&fe), Some(&de), &shell, &mock, Arc::new(ExplorationContextTool::new("test-ma".into())), false, 500, 10240, None).await;
     assert!(result.is_ok(), "应返回 Ok，实际: {:?}", result.err());
 }
 
@@ -460,7 +461,7 @@ async fn ma_032_fast_deep_fast_shell_alternation() {
     let de = MockDeepExplore::new(mock_de_result());
     let shell = MockShellExecute::new(mock_shell_result());
 
-    let _ = agent.run("test", "", &fe, Some(&de), &shell, &mock).await;
+    let _ = agent.run("test", "", Some(&fe), Some(&de), &shell, &mock, Arc::new(ExplorationContextTool::new("test-ma".into())), false, 500, 10240, None).await;
     assert!(true, "stub 占位");
 }
 
@@ -475,7 +476,7 @@ async fn ma_033_tool_call_missing_tool_field() {
     let de = MockDeepExplore::new(mock_de_result());
     let shell = MockShellExecute::new(mock_shell_result());
 
-    let result = agent.run("test", "", &fe, Some(&de), &shell, &mock).await;
+    let result = agent.run("test", "", Some(&fe), Some(&de), &shell, &mock, Arc::new(ExplorationContextTool::new("test-ma".into())), false, 500, 10240, None).await;
     assert!(result.is_ok(), "应返回 Ok，实际: {:?}", result.err());
 }
 
@@ -495,7 +496,7 @@ async fn ma_034_execute_shell_failure_then_fe() {
     let de = MockDeepExplore::new(mock_de_result());
     let shell = MockShellExecute::new(Err("command not allowed".to_string()));
 
-    let result = agent.run("test", "", &fe, Some(&de), &shell, &mock).await;
+    let result = agent.run("test", "", Some(&fe), Some(&de), &shell, &mock, Arc::new(ExplorationContextTool::new("test-ma".into())), false, 500, 10240, None).await;
     assert!(result.is_ok(), "应返回 Ok，实际: {:?}", result.err());
 }
 
@@ -510,7 +511,7 @@ async fn ma_035_execute_shell_normal() {
     let de = MockDeepExplore::new(mock_de_result());
     let shell = MockShellExecute::new(mock_shell_result());
 
-    let result = agent.run("项目有多少文件?", "", &fe, Some(&de), &shell, &mock).await;
+    let result = agent.run("项目有多少文件?", "", Some(&fe), Some(&de), &shell, &mock, Arc::new(ExplorationContextTool::new("test-ma".into())), false, 500, 10240, None).await;
     assert!(result.is_ok(), "应返回 Ok，实际: {:?}", result.err());
 }
 
@@ -541,7 +542,7 @@ async fn ma_041_de_disabled_fe_and_shell_work() {
     let shell = MockShellExecute::new(mock_shell_result());
 
     // DE=None → disabled
-    let result = agent.run("项目有多少文件?", "", &fe, None, &shell, &mock).await;
+    let result = agent.run("项目有多少文件?", "", Some(&fe), None, &shell, &mock, Arc::new(ExplorationContextTool::new("test-ma".into())), false, 500, 10240, None).await;
     assert!(result.is_ok(), "FE+shell without DE must work, got: {:?}", result.err());
 }
 
@@ -556,7 +557,7 @@ async fn ma_042_de_disabled_rejects_de_tool_call() {
     let fe = MockFastExplore::new(mock_fe_result());
     let shell = MockShellExecute::new(mock_shell_result());
 
-    let result = agent.run("test", "", &fe, None, &shell, &mock).await;
+    let result = agent.run("test", "", Some(&fe), None, &shell, &mock, Arc::new(ExplorationContextTool::new("test-ma".into())), false, 500, 10240, None).await;
     assert!(result.is_ok(), "DE disabled → DE call gracefully handled, got: {:?}", result.err());
 }
 
@@ -570,6 +571,176 @@ async fn ma_043_de_disabled_shell_only() {
     let fe = MockFastExplore::new(mock_fe_result());
     let shell = MockShellExecute::new(mock_shell_result());
 
-    let result = agent.run("找 rs 文件", "", &fe, None, &shell, &mock).await;
+    let result = agent.run("找 rs 文件", "", Some(&fe), None, &shell, &mock, Arc::new(ExplorationContextTool::new("test-ma".into())), false, 500, 10240, None).await;
     assert!(result.is_ok(), "shell-only without DE must work, got: {:?}", result.err());
+}
+
+fn mock_compact_response() -> Result<UnifiedResponse, String> {
+    mock_json(r#"{"summary":"对话摘要：探索了项目结构","key_files":["main.rs"],"next_steps":"继续查看配置"}"#)
+}
+
+// ============================================================================
+// Shell-only conversation compact tests
+// ============================================================================
+
+/// MA-044: 纯 shell 模式，低 context_limit 触发 token 阈值 compact
+#[tokio::test]
+async fn ma_044_shell_only_compact_token_threshold() {
+    let agent = MainAgent::new();
+    let mock = MockLlmClient::new();
+    // 1) LLM calls shell
+    mock.push_response(mock_tool_call("execute_shell", r#"{"command":"grep -rn fn src/"}"#));
+    // 2) compact fires (context_limit=21000 → usable≈0, fires immediately)
+    mock.push_response(mock_compact_response());
+    // 3) LLM answers
+    mock.push_response(mock_answer("探索完成"));
+
+    let fe = MockFastExplore::new(mock_fe_result());
+    let shell = MockShellExecute::new(mock_shell_result());
+
+    // shell_only_mode=true + low context_limit → compact after 1st shell
+    let result = agent.run(
+        "搜索代码", "",
+        Some(&fe), None, &shell, &mock,
+        Arc::new(ExplorationContextTool::new("test-ma".into())),
+        true, 500, 10240, None, // shell_only
+    ).await;
+    assert!(result.is_ok(), "shell-only compact must work, got: {:?}", result.err());
+}
+
+/// MA-045: 纯 shell 模式，shell_only_mode=true 但 set 了 context_limit=None，
+///         回退到 10 轮计数触发 compact
+#[tokio::test]
+async fn ma_045_shell_only_compact_fallback_rounds() {
+    let agent = MainAgent::new();
+    let mock = MockLlmClient::new();
+
+    // 10 shell calls → compact after 10th
+    for _ in 0..10 {
+        mock.push_response(mock_tool_call("execute_shell", r#"{"command":"ls"}"#));
+    }
+    // compact fires
+    mock.push_response(mock_compact_response());
+    // final answer
+    mock.push_response(mock_answer("探索完成"));
+
+    let fe = MockFastExplore::new(mock_fe_result());
+    let shell = MockShellExecute::new(mock_shell_result());
+
+    let result = agent.run(
+        "列出所有文件", "",
+        Some(&fe), None, &shell, &mock,
+        Arc::new(ExplorationContextTool::new("test-ma".into())),
+        true, 500, 10240, None, // shell_only
+    ).await;
+    assert!(result.is_ok(), "shell-only fallback compact must work, got: {:?}", result.err());
+}
+
+/// MA-046: doom-loop 检测 —— 相同命令连调 3 次触发警告，但不拦截执行
+#[tokio::test]
+async fn ma_046_shell_dedup_blocks_repeat() {
+    let agent = MainAgent::new();
+    let mock = MockLlmClient::new();
+    // 3 same calls → doom-loop warning injected (still executes, not blocked)
+    for _ in 0..3 {
+        mock.push_response(mock_tool_call("execute_shell", r#"{"command":"grep -rn fn src/"}"#));
+    }
+    // After warning, LLM changes direction
+    mock.push_response(mock_tool_call("execute_shell", r#"{"command":"grep -rn struct src/"}"#));
+    // Final answer
+    mock.push_response(mock_answer("探索完成"));
+
+    let fe = MockFastExplore::new(mock_fe_result());
+    let shell = MockShellExecute::new(mock_shell_result());
+
+    let result = agent.run(
+        "搜索代码", "",
+        Some(&fe), None, &shell, &mock,
+        Arc::new(ExplorationContextTool::new("test-ma".into())),
+        false, 500, 10240, None,
+    ).await;
+    assert!(result.is_ok(), "doom-loop must not crash, got: {:?}", result.err());
+    assert_eq!(shell.call_count(), 4, "all 4 commands executed (doom-loop warns but does not block)");
+}
+
+// ============================================================================
+// Prompt dynamic assembly tests
+// ============================================================================
+
+/// Helper: wrap run() to capture the system prompt from messages[0]
+async fn capture_system_prompt(
+    enable_fe: bool,
+    enable_de: bool,
+) -> String {
+    use std::sync::Mutex as StdMutex;
+
+    struct CapturingMock {
+        prompt: StdMutex<Option<String>>,
+        inner: MockLlmClient,
+    }
+    #[async_trait::async_trait]
+    impl LlmToolClient for &CapturingMock {
+        async fn call_llm_with_tools(
+            &self, messages: &[serde_json::Value], _tools: &[serde_json::Value],
+            _rf: Option<&serde_json::Value>,
+        ) -> Result<UnifiedResponse, String> {
+            // Capture system prompt on first call
+            if self.prompt.lock().unwrap().is_none() {
+                let p = messages[0].get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                *self.prompt.lock().unwrap() = Some(p);
+                return Err("captured".to_string()); // stop early
+            }
+            Err("unexpected second call".to_string())
+        }
+    }
+    #[async_trait::async_trait]
+    impl LlmStructuredClient for &CapturingMock {
+        async fn call_llm_structured(
+            &self, _i: &str, _d: &serde_json::Value, _s: Option<&serde_json::Value>,
+        ) -> Result<UnifiedResponse, String> {
+            Err("unexpected".to_string())
+        }
+    }
+
+    let capturing = CapturingMock { prompt: StdMutex::new(None), inner: MockLlmClient::new() };
+    let fe: Option<&dyn FastExploreExecutor> = if enable_fe { Some(&MockFastExplore::new(mock_fe_result())) } else { None };
+    let de: Option<&dyn DeepExploreExecutor> = if enable_de { Some(&MockDeepExplore::new(mock_de_result())) } else { None };
+    let shell = MockShellExecute::new(mock_shell_result());
+    let agent = MainAgent::new();
+    let _ = agent.run("测试", "", fe, de, &shell, &&capturing, Arc::new(ExplorationContextTool::new("ma".into())), !enable_fe && !enable_de, 500, 10240, None).await;
+    let result = capturing.prompt.lock().unwrap().take().unwrap_or_default();
+    result
+}
+
+/// MA-050: shell-only 模式下 prompt 不含 fast_explore 和 deep_explore
+#[tokio::test]
+async fn ma_050_shell_only_prompt_excludes_fe_de() {
+    let prompt = capture_system_prompt(false, false).await;
+    assert!(prompt.contains("execute_shell"), "must contain execute_shell: {}", prompt);
+    assert!(!prompt.contains("fast_explore"), "must NOT contain fast_explore: {}", prompt);
+    assert!(!prompt.contains("deep_explore"), "must NOT contain deep_explore: {}", prompt);
+    assert!(prompt.contains("一个工具"), "must say 一个工具, got: {}", prompt);
+    assert!(prompt.contains("tool\": \"execute_shell"), "must have shell example, got: {}", prompt);
+    assert!(!prompt.contains("tool\": \"fast_explore"), "must NOT have fe example: {}", prompt);
+    assert!(!prompt.contains("tool\": \"deep_explore"), "must NOT have de example: {}", prompt);
+}
+
+/// MA-051: FE 禁用、DE 启用时 prompt 不含 fast_explore
+#[tokio::test]
+async fn ma_051_fe_disabled_prompt_excludes_fe() {
+    let prompt = capture_system_prompt(false, true).await;
+    assert!(prompt.contains("execute_shell"), "must contain execute_shell");
+    assert!(!prompt.contains("fast_explore"), "must NOT contain fast_explore");
+    assert!(prompt.contains("deep_explore"), "must contain deep_explore");
+    assert!(prompt.contains("两个工具"), "must say 两个工具, got: {}", prompt);
+}
+
+/// MA-052: 全启用时 prompt 含所有工具
+#[tokio::test]
+async fn ma_052_all_enabled_prompt_has_all() {
+    let prompt = capture_system_prompt(true, true).await;
+    assert!(prompt.contains("fast_explore"), "must contain fast_explore");
+    assert!(prompt.contains("deep_explore"), "must contain deep_explore");
+    assert!(prompt.contains("execute_shell"), "must contain execute_shell");
+    assert!(prompt.contains("三个工具"), "must say 三个工具, got: {}", prompt);
 }

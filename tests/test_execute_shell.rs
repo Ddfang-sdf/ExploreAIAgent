@@ -274,13 +274,14 @@ fn es_015_sed_inplace_blocked() {
 
 // ===== 8.7.2 Dangerous Operator Tests =====
 
-/// ES-020: Output redirect >
+/// ES-020: Output redirect > to workspace file still blocked
 #[test]
 fn es_020_redirect_out() {
     let fixture = common::create_test_fixture();
     let root = fixture.path();
     let tool = make_tool(root);
 
+    // > to relative path (inside workspace) → blocked
     let input = make_input(root, serde_json::json!({
         "command": "ls > output.txt"
     }));
@@ -288,6 +289,22 @@ fn es_020_redirect_out() {
     let result = tool.execute(input);
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().code, ErrorCode::ShellDangerousOperator);
+}
+
+/// ES-020a: Output redirect > to /dev/null allowed
+#[test]
+fn es_020a_redirect_dev_null() {
+    let fixture = common::create_test_fixture();
+    let root = fixture.path();
+    let tool = make_tool(root);
+
+    let input = make_input(root, serde_json::json!({
+        "command": "grep main src/main.rs > /dev/null"
+    }));
+
+    let result = tool.execute(input);
+    assert!(result.is_ok(),
+        "> /dev/null should be allowed, got: {:?}", result.err());
 }
 
 /// ES-021: Append redirect >>
@@ -306,23 +323,24 @@ fn es_021_redirect_append() {
     assert_eq!(result.unwrap_err().code, ErrorCode::ShellDangerousOperator);
 }
 
-/// ES-022: Command substitution $()
+/// ES-022: $() with whitelisted inner command → allowed
 #[test]
 fn es_022_command_substitution() {
     let fixture = common::create_test_fixture();
     let root = fixture.path();
     let tool = make_tool(root);
 
+    // $() is allowed; inner command grep is whitelisted
     let input = make_input(root, serde_json::json!({
-        "command": "echo $(rm -rf /)"
+        "command": "echo $(grep main src/main.rs)"
     }));
 
     let result = tool.execute(input);
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err().code, ErrorCode::ShellDangerousOperator);
+    assert!(result.is_ok(),
+        "$() with whitelisted inner command should be allowed, got: {:?}", result.err());
 }
 
-/// ES-023: Backtick command substitution
+/// ES-023: Backtick with whitelisted inner command → allowed
 #[test]
 fn es_023_backtick_substitution() {
     let fixture = common::create_test_fixture();
@@ -330,60 +348,66 @@ fn es_023_backtick_substitution() {
     let tool = make_tool(root);
 
     let input = make_input(root, serde_json::json!({
-        "command": "echo `whoami`"
+        "command": "echo `grep main src/main.rs`"
     }));
 
     let result = tool.execute(input);
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err().code, ErrorCode::ShellDangerousOperator);
+    assert!(result.is_ok(),
+        "backticks with whitelisted inner command should be allowed, got: {:?}", result.err());
 }
 
-/// ES-024: Semicolon separator
+/// ES-024: ; splits commands, second command blocked by whitelist
 #[test]
 fn es_024_semicolon() {
     let fixture = common::create_test_fixture();
     let root = fixture.path();
     let tool = make_tool(root);
 
+    // ; splits — second command 'rm' is blocked by whitelist
     let input = make_input(root, serde_json::json!({
         "command": "ls; rm -rf /"
     }));
 
     let result = tool.execute(input);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().code, ErrorCode::ShellDangerousOperator);
+    assert_eq!(result.unwrap_err().code, ErrorCode::ShellCmdNotAllowed,
+        "rm should be caught by whitelist after ; split");
 }
 
-/// ES-025: Logical AND &&
+/// ES-025: && splits commands, second command blocked by whitelist
 #[test]
 fn es_025_logical_and() {
     let fixture = common::create_test_fixture();
     let root = fixture.path();
     let tool = make_tool(root);
 
+    // && splits — second command 'rm' is blocked by whitelist
     let input = make_input(root, serde_json::json!({
         "command": "ls && rm -rf /"
     }));
 
     let result = tool.execute(input);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().code, ErrorCode::ShellDangerousOperator);
+    assert_eq!(result.unwrap_err().code, ErrorCode::ShellCmdNotAllowed,
+        "rm should be caught by whitelist after && split");
 }
 
-/// ES-026: Logical OR ||
+/// ES-026: || splits commands, second command blocked by whitelist
 #[test]
 fn es_026_logical_or() {
     let fixture = common::create_test_fixture();
     let root = fixture.path();
     let tool = make_tool(root);
 
+    // || splits — second command 'rm' is blocked by whitelist
     let input = make_input(root, serde_json::json!({
         "command": "ls || rm -rf /"
     }));
 
     let result = tool.execute(input);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().code, ErrorCode::ShellDangerousOperator);
+    assert_eq!(result.unwrap_err().code, ErrorCode::ShellCmdNotAllowed,
+        "rm should be caught by whitelist after || split");
 }
 
 /// ES-028: tee command
@@ -709,21 +733,18 @@ fn whitelist_blocks_dangerous_commands() {
 
 #[test]
 fn dangerous_operators_detected() {
+    let root = std::path::Path::new(".");
+    // These should STILL be blocked
     let dangerous = vec![
-        "ls > out.txt",
-        "ls >> out.txt",
-        "echo $(whoami)",
-        "echo `whoami`",
-        "ls; rm -rf /",
-        "ls && rm -rf /",
-        "ls || rm -rf /",
-        "sleep 100 &",
-        "awk '{system(\"ls\")}' f",
-        "awk '{exec(\"ls\")}' f",
+        "ls > out.txt",            // > to relative path (workspace) → blocked
+        "ls >> out.txt",           // >> always blocked
+        "sleep 100 &",             // background &
+        "awk '{system(\"ls\")}' f", // system() in awk
+        "awk '{exec(\"ls\")}' f",  // exec() in awk
     ];
     for cmd in dangerous {
         assert!(
-            ShellSecurity::check_dangerous_operators(cmd).is_err(),
+            ShellSecurity::check_dangerous_operators(cmd, root).is_err(),
             "Command '{}' should be flagged as dangerous",
             cmd
         );
@@ -732,15 +753,25 @@ fn dangerous_operators_detected() {
 
 #[test]
 fn safe_operators_allowed() {
+    let root = std::path::Path::new(".");
     let safe = vec![
         "grep main file.rs",
         "cat src/main.rs",
         "find . -name '*.rs'",
         "wc -l file.txt",
+        // Now allowed:
+        "grep main file > /dev/null",     // > to /dev/null
+        "grep main file 2>&1",            // fd redirect
+        "echo $(grep main file)",         // $() with whitelisted inner cmd
+        "echo `grep main file`",          // backtick with whitelisted inner cmd
+        "grep main file; wc -l file",     // ; separator
+        "grep main file && wc -l file",   // && operator
+        "grep main file || echo no",      // || operator
+        "ls > /tmp/output.txt",           // > to /tmp (outside workspace)
     ];
     for cmd in safe {
         assert!(
-            ShellSecurity::check_dangerous_operators(cmd).is_ok(),
+            ShellSecurity::check_dangerous_operators(cmd, root).is_ok(),
             "Command '{}' should be considered safe",
             cmd
         );
@@ -755,20 +786,37 @@ fn sed_inplace_detected() {
 
 #[test]
 fn pipe_all_segments_must_be_whitelisted() {
-    assert!(ShellSecurity::check_pipe_commands("grep main | wc -l").is_ok());
-    assert!(ShellSecurity::check_pipe_commands("grep main | sort | uniq").is_ok());
-    assert!(ShellSecurity::check_pipe_commands("grep main | python").is_err());
-    assert!(ShellSecurity::check_pipe_commands("ls | tee out.txt").is_err());
+    let root = std::path::Path::new(".");
+    assert!(ShellSecurity::check_pipe_commands("grep main | wc -l", root).is_ok());
+    assert!(ShellSecurity::check_pipe_commands("grep main | sort | uniq", root).is_ok());
+    assert!(ShellSecurity::check_pipe_commands("grep main | python", root).is_err());
+    assert!(ShellSecurity::check_pipe_commands("ls | tee out.txt", root).is_err());
 }
 
 #[test]
 fn validate_command_full_pipeline() {
-    assert!(ShellSecurity::validate_command("grep -rn main src/").is_ok());
-    assert!(ShellSecurity::validate_command("rm -rf /").is_err());
-    assert!(ShellSecurity::validate_command("ls > out.txt").is_err());
-    assert!(ShellSecurity::validate_command("grep main | wc -l").is_ok());
-    assert!(ShellSecurity::validate_command("grep main | python").is_err());
-    assert!(ShellSecurity::validate_command("sed -i 's/a/b/' f").is_err());
+    let root = std::path::Path::new(".");
+    assert!(ShellSecurity::validate_command("grep -rn main src/", root).is_ok());
+    assert!(ShellSecurity::validate_command("rm -rf /", root).is_err());
+    // > to relative path (workspace) still blocked
+    assert!(ShellSecurity::validate_command("ls > out.txt", root).is_err());
+    // > to /dev/null now allowed
+    assert!(ShellSecurity::validate_command("ls > /dev/null", root).is_ok());
+    // > to /tmp now allowed
+    assert!(ShellSecurity::validate_command("ls > /tmp/out.txt", root).is_ok());
+    // 2>&1 now allowed
+    assert!(ShellSecurity::validate_command("grep main file 2>&1", root).is_ok());
+    assert!(ShellSecurity::validate_command("grep main | wc -l", root).is_ok());
+    assert!(ShellSecurity::validate_command("grep main | python", root).is_err());
+    assert!(ShellSecurity::validate_command("sed -i 's/a/b/' f", root).is_err());
+    // ; now splits commands, each validated
+    assert!(ShellSecurity::validate_command("grep main file; wc -l file", root).is_ok());
+    // ; with dangerous second command caught by whitelist
+    assert!(ShellSecurity::validate_command("grep main file; rm file", root).is_err());
+    // && splits commands
+    assert!(ShellSecurity::validate_command("grep main file && echo found", root).is_ok());
+    // && with dangerous second command caught by whitelist
+    assert!(ShellSecurity::validate_command("grep main file && rm file", root).is_err());
 }
 
 #[test]
@@ -943,9 +991,9 @@ fn e2e_008_redirect_in_double_quotes() {
         "> inside double quotes must NOT trigger redirect, got: {:?}", result.err());
 }
 
-/// E2E-009: real ; outside quotes must still be rejected
+/// E2E-009: real ; outside quotes now allowed (both commands whitelisted)
 #[test]
-fn e2e_009_real_semicolon_rejected() {
+fn e2e_009_semicolon_allowed() {
     let fixture = common::create_test_fixture();
     let root = fixture.path();
     let tool = make_tool(root);
@@ -954,8 +1002,12 @@ fn e2e_009_real_semicolon_rejected() {
         "command": "echo hello; echo world"
     }));
     let result = tool.execute(input);
-    assert!(result.is_err(),
-        "real ; outside quotes must still be rejected");
+    assert!(result.is_ok(),
+        "; with whitelisted commands should now be allowed, got: {:?}", result.err());
+    let output: ExecuteShellOutput = serde_json::from_value(result.unwrap().data).unwrap();
+    assert!(output.success);
+    assert!(output.output.contains("hello"));
+    assert!(output.output.contains("world"));
 }
 
 /// E2E-010: file extension counting pipeline (the user's real scenario)
@@ -1121,4 +1173,55 @@ fn es_066_line_truncation_rust_layer() {
     let lines: Vec<&str> = output.output.lines().collect();
     assert!(lines.len() <= 2000,
         "output must be truncated to ≤2000 lines, got {}", lines.len());
+}
+
+/// ES-070: pipe inside double quotes (grep -E pattern) must NOT be treated as pipe operator
+#[test]
+fn es_070_pipe_inside_double_quotes() {
+    let fixture = common::create_test_fixture();
+    let root = fixture.path();
+    let tool = make_tool(root);
+
+    std::fs::write(root.join("test.txt"), "trade\nbacktest\nstrategy\nengine\n").unwrap();
+
+    let input = make_input(root, serde_json::json!({
+        "command": "grep -E \"(trade|backtest)\" test.txt"
+    }));
+    let result = tool.execute(input);
+    assert!(result.is_ok(),
+        "| inside double quotes must NOT be treated as pipe, got: {:?}", result.err());
+}
+
+/// ES-071: pipe inside single quotes (awk pattern) must NOT be treated as pipe operator
+#[test]
+fn es_071_pipe_inside_single_quotes() {
+    let fixture = common::create_test_fixture();
+    let root = fixture.path();
+    let tool = make_tool(root);
+
+    std::fs::write(root.join("test.txt"), "a.txt\nb.txt\n").unwrap();
+
+    let input = make_input(root, serde_json::json!({
+        "command": "echo a.txt | awk -F. '{ if (NF>1) print $NF }'"
+    }));
+    let result = tool.execute(input);
+    assert!(result.is_ok(),
+        "| and > inside single quotes must NOT trigger operators, got: {:?}", result.err());
+}
+
+/// ES-072: grep with escaped pipe \\| inside double quotes
+#[test]
+fn es_072_grep_escaped_pipe_in_quotes() {
+    let fixture = common::create_test_fixture();
+    let root = fixture.path();
+    let tool = make_tool(root);
+
+    std::fs::write(root.join("code.java"), "SQL_ATTACK_VALIDATOR\nINJECTION_ATTACK\nSQL_INJECTION\n").unwrap();
+
+    let input = make_input(root, serde_json::json!({
+        "command": "grep -r \"SQL\\\\|INJECTION\" ."
+    }));
+    let result = tool.execute(input);
+    assert!(result.is_ok(),
+        "escaped pipe inside double quotes must NOT be treated as pipe, got: {:?}", result.err());
 }

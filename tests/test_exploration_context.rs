@@ -461,9 +461,9 @@ fn exploration_context_update_summary_recalculates_token_count() {
 fn exploration_context_needs_compression_over_threshold() {
     let ctx = ExplorationContextTool::new("session-1".to_string());
 
-    // Add many records with long summaries to exceed EXPLORATION_TOKEN_THRESHOLD (5500)
+    // Add many records with long summaries to exceed EXPLORATION_TOKEN_THRESHOLD (12000)
     let long_text = "This is a fairly long summary that contains substantial information. ".repeat(20);
-    for i in 0..30 {
+    for i in 0..50 {
         let record = ExplorationRecord::ToolCall {
             source: "DeepExplorer".to_string(),
             tool: "read_file".to_string(),
@@ -476,7 +476,7 @@ fn exploration_context_needs_compression_over_threshold() {
     }
 
     assert!(ctx.needs_compression(),
-        "Should need compression when token count exceeds 5500");
+        "Should need compression when token count exceeds 12000, actual={}", ctx.total_token_count());
 }
 
 // ECT-007: small-scale QE protection — 1 QE summary + 5 low-confidence records
@@ -592,4 +592,116 @@ fn exploration_record_summary_with_non_qe_source_is_not_qe_summary() {
         !record.is_quality_evaluator_summary(),
         "Summary with non-QE source should NOT be identified as QE summary (source mismatch)"
     );
+}
+
+// ============================================================================
+// ECT config reading tests
+// ============================================================================
+
+/// ECT-CFG-01: defaults from new() match the global constants
+#[test]
+fn ect_cfg_default_threshold_and_ratio() {
+    let ctx = ExplorationContextTool::new("cfg-default".to_string());
+    assert_eq!(ctx.token_threshold(), EXPLORATION_TOKEN_THRESHOLD,
+        "default threshold should match EXPLORATION_TOKEN_THRESHOLD ({})", EXPLORATION_TOKEN_THRESHOLD);
+    assert!((ctx.refiner_summary_ratio() - DEFAULT_REFINER_SUMMARY_RATIO).abs() < f64::EPSILON,
+        "default ratio should match DEFAULT_REFINER_SUMMARY_RATIO ({})", DEFAULT_REFINER_SUMMARY_RATIO);
+}
+
+/// ECT-CFG-02: configure() overwrites threshold and ratio from config
+#[test]
+fn ect_cfg_configure_reads_from_config() {
+    use explore_ai_agent::common::config::{ExplorationConfig, ContextConfig};
+
+    let mut ctx = ExplorationContextTool::new("cfg-override".to_string());
+
+    // Before configure → defaults
+    assert_eq!(ctx.token_threshold(), EXPLORATION_TOKEN_THRESHOLD);
+
+    // Build a custom config
+    let exploration = ExplorationConfig {
+        token_threshold: 15000,
+        token_target_ratio: 0.50,
+        refiner_summary_token_ratio: 0.30,
+    };
+    let context = ContextConfig::default();
+
+    ctx.configure(&exploration, &context);
+
+    // After configure → config values
+    assert_eq!(ctx.token_threshold(), 15000,
+        "configure() should set token_threshold from config");
+    assert!((ctx.refiner_summary_ratio() - 0.30).abs() < f64::EPSILON,
+        "configure() should set refiner_summary_ratio from config");
+}
+
+/// ECT-CFG-03: needs_compression respects configured threshold (not default)
+#[test]
+fn ect_cfg_needs_compression_respects_configured_threshold() {
+    use explore_ai_agent::common::config::{ExplorationConfig, ContextConfig};
+
+    let mut ctx = ExplorationContextTool::new("cfg-compress".to_string());
+
+    // Set a very high threshold so compression never triggers
+    let exploration = ExplorationConfig {
+        token_threshold: 999_999,
+        token_target_ratio: 0.70,
+        refiner_summary_token_ratio: 0.25,
+    };
+    let context = ContextConfig::default();
+    ctx.configure(&exploration, &context);
+
+    // Add many long records
+    let long_text = "token padding to increase count significantly. ".repeat(50);
+    for i in 0..50 {
+        let record = ExplorationRecord::ToolCall {
+            source: "shell".to_string(),
+            tool: "execute_shell".to_string(),
+            params: serde_json::json!({"command": format!("cmd_{}", i)}),
+            result_summary: format!("Round {}: {}", i, long_text),
+            confidence: 0.5,
+            timestamp: Utc::now(),
+        };
+        let _ = ctx.write_record(record);
+    }
+
+    // With threshold=999999, compression should NOT be needed
+    assert!(!ctx.needs_compression(),
+        "configured threshold=999999 should prevent compression trigger, token_count={}",
+        ctx.total_token_count());
+}
+
+/// ECT-CFG-04: low configured threshold triggers compression early
+#[test]
+fn ect_cfg_low_threshold_triggers_compression_early() {
+    use explore_ai_agent::common::config::{ExplorationConfig, ContextConfig};
+
+    let mut ctx = ExplorationContextTool::new("cfg-low".to_string());
+
+    // Set a very low threshold
+    let exploration = ExplorationConfig {
+        token_threshold: 500,
+        token_target_ratio: 0.70,
+        refiner_summary_token_ratio: 0.25,
+    };
+    let context = ContextConfig::default();
+    ctx.configure(&exploration, &context);
+
+    // Add enough records to exceed the low 500-token threshold
+    let padding = "padding text to reach the threshold. ".repeat(10);
+    for i in 0..10 {
+        let record = ExplorationRecord::ToolCall {
+            source: "shell".to_string(),
+            tool: "execute_shell".to_string(),
+            params: serde_json::json!({"command": format!("cmd_{}", i)}),
+            result_summary: format!("Result {}: {}", i, padding),
+            confidence: 0.5,
+            timestamp: Utc::now(),
+        };
+        let _ = ctx.write_record(record);
+    }
+
+    assert!(ctx.needs_compression(),
+        "configured threshold=500 should trigger compression, token_count={}",
+        ctx.total_token_count());
 }

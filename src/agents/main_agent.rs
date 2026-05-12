@@ -1,5 +1,10 @@
+use std::sync::Arc;
 use tokio::sync::mpsc;
-use crate::adapter::api_adapter::{LlmStructuredClient, LlmToolClient};
+use crate::adapter::api_adapter::{ApiAdapter, LlmStructuredClient, LlmToolClient};
+use crate::adapter::model::ModelAdapter;
+use crate::adapter::types::ToolDefinition;
+use crate::context::exploration::ExplorationContextTool;
+use crate::agents::conversation_compactor::ConversationCompactor;
 
 #[derive(Debug, Clone)]
 pub enum SseEvent { Thinking(String), Answer(String), Done }
@@ -9,7 +14,7 @@ pub fn sse_disable() { *SSE_TX.lock().unwrap() = None; }
 pub fn sse_send(e: SseEvent) { if let Some(tx) = SSE_TX.lock().unwrap().as_ref() { let _ = tx.send(e); } }
 
 // ============================================================================
-// v1.2: Trait definitions for dependency injection
+// Trait definitions for dependency injection
 // ============================================================================
 
 #[async_trait::async_trait]
@@ -31,6 +36,13 @@ pub trait ShellExecutor: Send + Sync {
     async fn execute(&self, command: &str) -> Result<serde_json::Value, String>;
 }
 
+/// Generic tool dispatcher — MainAgent calls this for every tool the LLM invokes.
+/// The orchestrator wires shell / FE / DE / base tools behind this single trait.
+#[async_trait::async_trait]
+pub trait ToolDispatcher: Send + Sync {
+    async fn dispatch(&self, tool_name: &str, arguments: &serde_json::Value) -> Result<serde_json::Value, String>;
+}
+
 pub struct MainAgent;
 
 impl MainAgent {
@@ -38,36 +50,34 @@ impl MainAgent {
         MainAgent
     }
 
-    /// v1.2: Decision loop — JSON communication with LLM, tool dispatch
+    /// Decision loop — native function-calling via ModelAdapter, tool dispatch via ToolDispatcher.
     pub async fn run(
         &self,
         question: &str,
         conversation_context: &str,
-        fast_explore: &dyn FastExploreExecutor,
-        de: Option<&dyn DeepExploreExecutor>,
-        shell: &dyn ShellExecutor,
-        client: &dyn LlmToolClient,
+        tools: Vec<ToolDefinition>,
+        dispatcher: &dyn ToolDispatcher,
+        client: Arc<ApiAdapter>,
+        model_adapter: &dyn ModelAdapter,
+        _exploration_context: Arc<ExplorationContextTool>,
+        shell_only_mode: bool,
+        compact_token_threshold: Option<usize>,
     ) -> Result<String, String> {
-        let enable_de = de.is_some();
-        let system_prompt_raw = Self::assemble_prompt();
-        let system_prompt = if enable_de {
-            system_prompt_raw
+        const DEFAULT_COMPACT_THRESHOLD: usize = 8000;
+        let compact_usable: Option<usize> = if shell_only_mode {
+            Some(compact_token_threshold.unwrap_or(DEFAULT_COMPACT_THRESHOLD))
         } else {
-            // Strip deep_explore section when DE is disabled
-            if let Some(start) = system_prompt_raw.find("### deep_explore") {
-                let after_start = &system_prompt_raw[start..];
-                if let Some(end_offset) = after_start.find("\n### execute_shell") {
-                    format!("{}{}", &system_prompt_raw[..start], &after_start[end_offset..])
-                } else {
-                    system_prompt_raw
-                }
-            } else {
-                system_prompt_raw
-            }
+            None
         };
-        let system_prompt = system_prompt
-            .replace("{shell_info}", &Self::shell_info())
-            .replace("{shell_commands}", &Self::shell_commands());
+        let mut shell_call_count: usize = 0;
+        let mut last_tool_key: Option<String> = None;
+        let mut catted_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut recent_commands: Vec<String> = Vec::new();
+        let mut same_tool_streak: usize = 0;
+        const DOOM_LOOP_THRESHOLD: usize = 2;
+        const FALLBACK_COMPACT_ROUNDS: usize = 10;
+
+        let system_prompt = Self::assemble_prompt();
         let user_content = if conversation_context.is_empty() {
             question.to_string()
         } else {
@@ -79,326 +89,228 @@ impl MainAgent {
             serde_json::json!({"role": "user", "content": user_content}),
         ];
 
-        let _schema = Self::action_schema();
-        let mut parse_retries: usize = 0;
-        const MAX_PARSE_RETRIES: usize = 2;
-        let mut first_call = true;
+        let tools_json = model_adapter.format_tools(&tools);
+
+        // OpenCode-style session retry: no hard cap, 2s base, double each attempt
+        let mut llm_error_count: usize = 0;
+        const SESSION_BASE_DELAY_MS: u64 = 2000;
+        const SESSION_MAX_DELAY_TIMEOUT_MS: u64 = 30_000;
+        const SESSION_MAX_DELAY_API_ERROR_MS: u64 = 120_000;
 
         loop {
-            if first_call {
-                eprintln!("⏳ 正在分析问题...");
-                first_call = false;
-            }
-            let rf = serde_json::json!({"type": "json_object"});
-            let response = client
-                .call_llm_with_tools(&messages, &[], Some(&rf))
-                .await?;
-
-            let text = match response.text {
-                Some(t) if !t.is_empty() => t,
-                _ => {
-                    if parse_retries < MAX_PARSE_RETRIES {
-                        messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": "你的回复为空。请按照 JSON 格式输出：{\"action\": \"answer\", ...} 或 {\"action\": \"tool_call\", ...}"
-                        }));
-                        parse_retries += 1;
-                        continue;
-                    }
-                    return Err("Empty response from LLM".to_string());
+            let response = match client
+                .invoke_llm_streaming(&messages, &tools_json, None, |text| {
+                    eprint!("\x1b[2m{}\x1b[0m", text);
+                })
+                .await
+            {
+                Ok((_raw, r)) => {
+                    eprintln!(); // separate thinking from tool output
+                    r
                 }
-            };
-
-            // Parse JSON action
-            let action_json: serde_json::Value = match serde_json::from_str(&text) {
-                Ok(v) => v,
                 Err(e) => {
-                    if parse_retries < MAX_PARSE_RETRIES {
-                        messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": format!("你的回复不是合法 JSON。请严格按照格式输出。错误: {}", e),
-                        }));
-                        parse_retries += 1;
-                        continue;
+                    let lower = e.to_lowercase();
+                    let is_non_retryable = lower.contains("llm api error (400)")
+                        || lower.contains("status code 400")
+                        || lower.contains("llm api error (401)")
+                        || lower.contains("llm api error (403)")
+                        || lower.contains("llm api error (404)")
+                        || lower.contains("authentication")
+                        || lower.contains("content policy")
+                        || lower.contains("invalid request")
+                        || lower.contains("bad request")
+                        || lower.contains("chat content is empty");
+                    if is_non_retryable {
+                        return Err(format!("Non-retryable LLM error: {}", e));
                     }
-                    return Err(format!("JSON parse retry exhausted: {}", e));
+
+                    llm_error_count += 1;
+                    let is_timeout = lower.contains("http timeout");
+                    let max_delay_ms = if is_timeout { SESSION_MAX_DELAY_TIMEOUT_MS } else { SESSION_MAX_DELAY_API_ERROR_MS };
+                    #[allow(clippy::cast_precision_loss)]
+                    let delay_ms = ((SESSION_BASE_DELAY_MS as f64) * 2f64.powi(llm_error_count as i32 - 1)) as u64;
+                    let delay = std::time::Duration::from_millis(delay_ms.min(max_delay_ms));
+
+                    eprintln!("\r\x1b[K  \x1b[2m❌ LLM call failed (attempt {}): {}\x1b[0m", llm_error_count, e);
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!("LLM API 调用失败(429/超时): {}。请稍等后重试，或基于已有信息直接回答。", e),
+                    }));
+                    if shell_only_mode && messages.len() > 4 {
+                        compact_conversation(&mut messages, &mut recent_commands, client.as_ref() as &dyn LlmToolClient).await;
+                    }
+                    eprintln!("\r\x1b[K  \x1b[2m⏳ LLM error backoff {}ms (attempt {})...\x1b[0m", delay_ms.min(max_delay_ms), llm_error_count);
+                    tokio::time::sleep(delay).await;
+                    continue;
                 }
             };
-            parse_retries = 0;
 
-            let action = action_json.get("action").and_then(|v| v.as_str()).unwrap_or("");
-
-            match action {
-                "answer" => {
-                    let final_response = action_json
-                        .get("final_response")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    return Ok(final_response.to_string());
+            // If the LLM returned text without tool calls → final answer
+            if let Some(text) = &response.text {
+                if response.tool_calls.is_empty() && !text.is_empty() {
+                    return Ok(text.clone());
                 }
-                "tool_call" => {
-                    let tool = action_json.get("tool").and_then(|v| v.as_str()).unwrap_or("");
-                    match tool {
-                        "fast_explore" => {
-                            eprintln!("\r\x1b[K🔍 正在搜索代码库...");
-                            sse_send(SseEvent::Thinking("🔍 正在搜索代码库...".into()));
-                            let keywords: Vec<String> = action_json
-                                .get("arguments")
-                                .and_then(|a| a.get("keywords"))
-                                .and_then(|k| k.as_array())
-                                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                                .unwrap_or_default();
+            }
+            // If the LLM returned nothing useful → retry with guidance
+            if response.tool_calls.is_empty() {
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": "你的回复为空。请使用工具探索代码库，或基于已有信息直接回答用户问题。",
+                }));
+                continue;
+            }
 
-                            match fast_explore.execute(&keywords).await {
-                                Ok(result) => {
-                                    let result_str = serde_json::to_string(&result).unwrap_or_default();
-                                    messages.push(serde_json::json!({
-                                        "role": "user",
-                                        "content": format!("fast_explore 返回结果:\n{}", result_str),
-                                    }));
-                                }
-                                Err(e) => {
-                                    messages.push(serde_json::json!({
-                                        "role": "user",
-                                        "content": format!("fast_explore 执行失败: {}", e),
-                                    }));
-                                }
-                            }
+            // --- Tool calls: append assistant message, dispatch each tool, append results ---
+            // Build assistant message from raw response (preserves model-specific fields)
+            // We need the raw response for this, but call_llm_with_tools returns UnifiedResponse.
+            // The raw response is not available here. For now, build a minimal assistant message.
+            // TODO: expose raw response from client to properly build assistant message.
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": response.text.clone().unwrap_or_default(),
+                "tool_calls": response.tool_calls.iter().map(|tc| {
+                    serde_json::json!({
+                        "id": tc.id.clone().unwrap_or_default(),
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": serde_json::to_string(&tc.arguments).unwrap_or_default(),
                         }
-                        "deep_explore" => {
-                            if let Some(de) = de {
-                                eprintln!("\r\x1b[K🔍 正在深入探索代码...");
-                                sse_send(SseEvent::Thinking("🔍 正在深入探索代码...".into()));
-                                let de_question = action_json
-                                    .get("arguments")
-                                    .and_then(|a| a.get("question"))
-                                    .and_then(|q| q.as_str())
-                                    .unwrap_or(question);
-                                let summary = action_json.get("arguments").and_then(|a| a.get("current_summary"));
+                    })
+                }).collect::<Vec<_>>(),
+            }));
 
-                                match de.execute(de_question, summary).await {
-                                    Ok(result) => {
-                                        let result_str = serde_json::to_string(&result).unwrap_or_default();
-                                        messages.push(serde_json::json!({
-                                            "role": "user",
-                                            "content": format!("deep_explore 返回结果:\n{}", result_str),
-                                        }));
-                                    }
-                                    Err(e) => {
-                                        messages.push(serde_json::json!({
-                                            "role": "user",
-                                            "content": format!("deep_explore 执行失败: {}", e),
-                                        }));
-                                    }
-                                }
-                            } else {
-                                messages.push(serde_json::json!({
-                                    "role": "user",
-                                    "content": "deep_explore 当前不可用。可用工具为 fast_explore、execute_shell。",
-                                }));
-                            }
-                        }
-                        "execute_shell" => {
-                            let reasoning = action_json.get("reasoning").and_then(|v| v.as_str()).unwrap_or("");
-                            let thinking = if reasoning.is_empty() { "执行 Shell 命令".to_string() } else { reasoning.to_string() };
-                            eprintln!("\r\x1b[K  \x1b[2m⬩ {}\x1b[0m", thinking);
-                            sse_send(SseEvent::Thinking(thinking));
-                            let command = action_json
-                                .get("arguments")
-                                .and_then(|a| a.get("command"))
-                                .and_then(|c| c.as_str())
-                                .unwrap_or("");
-                            match shell.execute(command).await {
-                                Ok(result) => {
-                                    let result_str = serde_json::to_string(&result).unwrap_or_default();
-                                    let preview: String = result_str.chars().take(200).collect();
-                                    eprintln!("\r\x1b[K  \x1b[2m⚡ ok: {} → {}\x1b[0m", command.chars().take(80).collect::<String>(), preview);
-                                    messages.push(serde_json::json!({
-                                        "role": "user",
-                                        "content": format!("execute_shell 返回结果:\n{}", result_str),
-                                    }));
-                                }
-                                Err(e) => {
-                                    eprintln!("\r\x1b[K  \x1b[2m⚠ fail: {} | cmd: {}\x1b[0m", e, command);
-                                    messages.push(serde_json::json!({
-                                        "role": "user",
-                                        "content": format!("execute_shell 执行失败: {} | 命令: {}", e, command),
-                                    }));
-                                }
-                            }
-                        }
-                        _ => {
+            for tc in &response.tool_calls {
+                let tool_name = &tc.name;
+                eprintln!("\r\x1b[K  \x1b[2m⬩ {}\x1b[0m", tool_name);
+                sse_send(SseEvent::Thinking(tool_name.clone()));
+
+                // Doom-loop detection
+                let tool_key = format!("{}|{}", tool_name, serde_json::to_string(&tc.arguments).unwrap_or_default());
+                if Some(tool_key.as_str()) == last_tool_key.as_deref() {
+                    same_tool_streak += 1;
+                } else {
+                    same_tool_streak = 1;
+                    last_tool_key = Some(tool_key);
+                }
+                if same_tool_streak >= DOOM_LOOP_THRESHOLD {
+                    eprintln!("\r\x1b[K  \x1b[2m⟳ doom-loop warning ({}× same call)\x1b[0m", same_tool_streak);
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!(
+                            "注意：你已连续 {} 次调用相同工具相同参数。如果确实需要重复，请说明理由；否则请检查已有结果，尝试不同方向。",
+                            same_tool_streak
+                        ),
+                    }));
+                    same_tool_streak = 0;
+                }
+
+                // Cat-file dedup for execute_shell
+                if tool_name == "execute_shell" {
+                    if let Some(cmd) = tc.arguments.get("command").and_then(|c| c.as_str()) {
+                        let cmd_trimmed = cmd.trim();
+                        let cat_target = if cmd_trimmed.starts_with("cat ") || cmd_trimmed.starts_with("cat\t") {
+                            cmd_trimmed[3..].trim().split(|c: char| c.is_whitespace() || c == '|' || c == ';').next().unwrap_or("").to_string()
+                        } else {
+                            String::new()
+                        };
+                        if !cat_target.is_empty() && catted_files.contains(&cat_target) {
+                            eprintln!("\r\x1b[K  \x1b[2m⛔ repeat cat blocked: {}\x1b[0m", cat_target);
                             messages.push(serde_json::json!({
                                 "role": "user",
-                                "content": "未知工具。可用工具为 fast_explore、deep_explore、execute_shell。",
+                                "content": format!("你已读取过 {}。如需更多内容，请用 sed -n '行范围p' 读取特定行；或用 grep -n 搜索关键词定位后再读。", cat_target),
                             }));
+                        }
+                        if !cat_target.is_empty() {
+                            catted_files.insert(cat_target);
                         }
                     }
                 }
-                _ => {
-                    if parse_retries < MAX_PARSE_RETRIES {
+
+                // Dispatch the tool
+                match dispatcher.dispatch(tool_name, &tc.arguments).await {
+                    Ok(result) => {
+                        let result_str = serde_json::to_string(&result).unwrap_or_default();
+                        let preview: String = result_str.chars().take(60).collect();
+                        let truncated = result.get("truncated").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let display = if tool_name == "execute_shell" {
+                            let cmd = tc.arguments.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                            format!("{} {}", tool_name, cmd.chars().take(50).collect::<String>())
+                        } else {
+                            tool_name.to_string()
+                        };
+                        eprintln!("\r\x1b[K  \x1b[2m⚡ ok: {} → {}\x1b[0m", display, preview);
+
+                        let mut content = result_str;
+                        if truncated {
+                            content.push_str("\n\n[输出已截断。此文件可能很大，请改用 grep 搜索关键词定位目标行]");
+                        }
                         messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": "缺少 action 字段。请输出 {\"action\": \"answer\", ...} 或 {\"action\": \"tool_call\", ...}",
+                            "role": "tool",
+                            "tool_call_id": tc.id.clone().unwrap_or_default(),
+                            "content": content,
                         }));
-                        parse_retries += 1;
-                    } else {
-                        return Err("Missing action field after retries".to_string());
+
+                        if tool_name == "execute_shell" {
+                            if let Some(cmd) = tc.arguments.get("command").and_then(|c| c.as_str()) {
+                                recent_commands.push(cmd.to_string());
+                            }
+                            shell_call_count += 1;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("\r\x1b[K  \x1b[2m⚠ fail: {} | tool: {}\x1b[0m", e, tool_name);
+                        messages.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": tc.id.clone().unwrap_or_default(),
+                            "content": format!("执行失败: {}", e),
+                        }));
+                    }
+                }
+
+                // Shell-only mode: conversation-level compaction
+                if shell_only_mode && shell_call_count > 0 {
+                    let total_tokens: usize = messages.iter()
+                        .map(|m| serde_json::to_string(m).unwrap_or_default().len() / 4)
+                        .sum();
+                    let should_compact = match compact_usable {
+                        Some(usable) => total_tokens >= usable,
+                        None => shell_call_count >= FALLBACK_COMPACT_ROUNDS,
+                    };
+                    if should_compact && messages.len() > 3 {
+                        compact_conversation(&mut messages, &mut recent_commands, client.as_ref() as &dyn LlmToolClient).await;
                     }
                 }
             }
         }
     }
-
-    pub fn action_schema() -> serde_json::Value {
-        serde_json::json!({
-            "name": "main_agent_action",
-            "strict": true,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["answer", "tool_call"]},
-                    "final_response": {"type": "string"},
-                    "tool": {"type": "string", "enum": ["fast_explore", "deep_explore", "execute_shell"]},
-                    "arguments": {"type": "object"}
-                },
-                "required": ["action"]
-            }
-        })
-    }
-
-    #[deprecated]
-    pub fn new_legacy() -> Self {
-        MainAgent
-    }
-
-    /// Extract the answer from LLM response text.
-    /// Tries in order: <final_response> tags, JSON "final_response" field, raw text.
-    fn extract_answer(raw: &str) -> String {
-        // Try <final_response>...</final_response> tags
-        if let Some(start) = raw.find("<final_response>") {
-            let after_tag = &raw[start + "<final_response>".len()..];
-            if let Some(end) = after_tag.find("</final_response>") {
-                return after_tag[..end].trim().to_string();
-            }
-        }
-
-        // Try JSON: parse and look for "final_response" key
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(raw) {
-            if let Some(text) = json.get("final_response").and_then(|v| v.as_str()) {
-                if !text.is_empty() {
-                    return text.to_string();
-                }
-            }
-        }
-
-        raw.trim().to_string()
-    }
-
-    pub async fn generate_answer(
-        &self,
-        user_question: &str,
-        conversation_context: &str,
-        exploration_data: &serde_json::Value,
-        client: &dyn LlmStructuredClient,
-    ) -> Result<String, String> {
-        let input_data = serde_json::json!({
-            "user_question": user_question,
-            "conversation_context": conversation_context,
-            "exploration_data": exploration_data,
-        });
-
-        let instructions = Self::assemble_prompt();
-
-        let response = client
-            .call_llm_structured(&instructions, &input_data, None)
-            .await?;
-
-        match response.text {
-            Some(text) if !text.is_empty() => Ok(Self::extract_answer(&text)),
-            _ => Err("Empty response from LLM".to_string()),
-        }
-    }
-
 
     pub fn assemble_prompt() -> String {
         String::from(
             "你是探索者（Explore AI Agent），一个专业的代码库探索助手。\n\
-             你的工作方式是：理解用户问题，必要时调用代码库搜索工具获取信息，基于搜索结果回答用户。\n\
+             你的工作方式是：理解用户问题，调用可用工具获取代码库信息，基于结果回答用户。\n\
              \n\
-             ## 可用工具\n\
+             ## 回复风格\n\
+             - 简洁直接，问什么答什么。1-3 句话或简短段落即可，不要长篇大论。\n\
+             - 不要在回答前后加铺垫或总结（如\"以下是结果...\"、\"综上所述...\"），直接给答案。\n\
+             - 只在用户明确要求时才使用 emoji。\n\
+             - 引用代码位置时使用 file_path:line_number 格式。\n\
              \n\
-             你可以调用以下三个工具。工具的具体输入输出格式由系统控制，以下是它们的能力描述和数据结构：\n\
-             \n\
-             ### fast_explore — 快速扫描代码库\n\
-             \n\
-             根据你设计的关键词批量搜索代码库，返回线索摘要和置信度评分。\n\
-             \n\
-             | 项目 | 说明 |\n\
-             |:---|:---|\n\
-             | 输入 | keywords（字符串数组）：2-5 个搜索关键词。你需要自己设计关键词——从用户问题中提取核心概念，中英文兼顾 |\n\
-             | 输出 | matches（搜索结果）、key_findings（核心发现）、critical_files（关键文件列表）、confidence（置信度 0.0~1.0） |\n\
-             | 适用 | 可选用。首次探索时快速了解项目中与问题相关的模块分布，帮你找到大方向 |\n\
-             | 限制 | 关键词匹配，覆盖面有限。可能遗漏重要代码，不可替代 deep_explore |\n\
-             \n\
-             输出示例：\n\
-             {\"matches\": [...], \"key_findings\": \"回测模块在 backtest/engine.py 中实现\", \"critical_files\": [{\"path\": \"src/backtest/engine.py\", \"summary\": \"回测引擎核心\"}], \"confidence\": 0.8}\n\
-             \n\
-             ### deep_explore — 深度代码探索\n\
-             \n\
-             深入阅读代码文件，精确定位代码证据。\n\
-             \n\
-             | 项目 | 说明 |\n\
-             |:---|:---|\n\
-             | 输入 | question（字符串）：要调查的问题。current_summary（对象，可选）：已有的探索线索摘要 |\n\
-             | 输出 | critical_files（相关文件及说明）、collected_evidence（代码证据列表，每条含 file、line、code_snippet、relevance）、missing_info（缺失信息） |\n\
-             | 适用 | 主力探索工具。直接搜索代码库、阅读文件、追溯调用链、收集代码证据。任何时候需要深入调查都可以直接调用 |\n\
-             | 限制 | 耗时较长（内部最多 75 次操作）。deep_explore 已穷尽搜索，结果即为该问题可获得的全部证据，不应质疑或重试 |\n\
-             \n\
-             输出示例：\n\
-             {\"critical_files\": [{\"path\": \"src/backtest/engine.py\", \"summary\": \"回测引擎核心\"}], \"collected_evidence\": [{\"file\": \"src/backtest/engine.py\", \"line\": \"142-158\", \"code_snippet\": \"def run_backtest...\", \"relevance\": \"回测主循环\"}], \"missing_info\": \"无\"}\n\
-             \n\
-             ### execute_shell — 执行只读 Shell 命令\n\
-             \n\
-             当前 Shell：{shell_info}。可用命令：{shell_commands}（sed 禁止 -i）。\n\
-             grep 搜索代码、find 查文件、awk/sed 文本处理、wc 统计、管道组合过滤。\n\
-             \n\
-             | 项目 | 说明 |\n\
-             |:---|:---|\n\
-             | 输入 | command（字符串）：只读 Shell 命令 |\n\
-             | 输出 | success（是否成功）、output。失败时含 error |\n\
-             | 限制 | 禁止 > 重定向、tee、rm mv cp mkdir 等写入操作。管道命令必须在白名单内。output 最多 50KB（约 2000 行），超出丢弃 |\n\
+             ## 工具使用策略\n\
+             - 拿到有价值的工具结果后，基于结果推进下一步，不要反复搜索相同内容。\n\
+             - 探索代码库时优先用精确的 search_content/search_files 定位，而非 read_file 整个文件再看。\n\
              \n\
              ## 规则\n\
-             \n\
              1. 任何关于代码库的问题，必须先探索再回答。严禁在未探索的情况下猜测或说\"信息不足\"。\n\
-             2. 纯问候（\"你好\"、\"谢谢\"、\"再见\"）或追问刚探索过的话题（\"再详细说说\"）可不调工具直接回答。\n\
+             2. 纯问候（\"你好\"、\"谢谢\"）或追问刚探索过的话题可不调工具直接回答。\n\
              3. 严禁编造代码细节。若探索后仍证据不足，如实告知。\n\
-             4. deep_explore 输出的 missing_info 字段不作为重试触发条件。missing_info 表示该次搜索未覆盖的盲区，不影响已收集证据的有效性。\n\
-             \n\
-             ## 通信协议\n\
-             \n\
-             你与系统之间通过 JSON 通信。每次回复必须是合法的 JSON 对象，action 字段决定操作类型：\n\
-             \n\
-             直接回答用户时：\n\
-             {\"action\": \"answer\", \"final_response\": \"答案内容\"}\n\
-             \n\
-             调用工具时：\n\
-             {\"action\": \"tool_call\", \"tool\": \"fast_explore\", \"arguments\": {\"keywords\": [\"回测\", \"backtest\", \"引擎\"]}}\n\
-             {\"action\": \"tool_call\", \"tool\": \"deep_explore\", \"arguments\": {\"question\": \"用户问题\", \"current_summary\": {...}}}\n\
-             {\"action\": \"tool_call\", \"tool\": \"execute_shell\", \"arguments\": {\"command\": \"find . -name '*.rs' | wc -l\"}, \"reasoning\": \"你的判断依据\"}}\n\
-             \n\
-             注意：只输出 JSON，不要包裹任何标记或解释文字。如果你的回答不符合 JSON 要求，系统将强制你重新回答，请务必按照通信协议规范的返回 JSON！",
+             4. 系统检测到连续 2 次相同工具调用时会提醒你检查是否陷入循环。",
         )
     }
 
     pub fn shell_info() -> String {
         if cfg!(target_os = "windows") {
-            if has_usable_bash() {
-                "bash (Windows)".to_string()
-            } else {
-                "cmd.exe (Windows)".to_string()
-            }
+            if has_usable_bash() { "bash (Windows)".to_string() } else { "cmd.exe (Windows)".to_string() }
         } else {
             "bash (Unix)".to_string()
         }
@@ -411,14 +323,109 @@ impl MainAgent {
             "cat head tail less grep egrep fgrep find ls tree wc sort uniq cut tr awk sed file stat echo".to_string()
         }
     }
+
+    pub fn shell_notes() -> String {
+        let info = Self::shell_info();
+        if info.starts_with("cmd") {
+            "## Shell 注意：cmd.exe\n\
+             - 不支持 && 链式调用，用 & 代替（但 & 不保证前序成功）\n\
+             - 变量用 %VAR% 格式\n\
+             - 路径有空格时必须用双引号包裹\n\
+             - 命令名：type（读文件）、dir（列目录）、findstr（搜索文本）".to_string()
+        } else if info.starts_with("bash") {
+            "## Shell 注意：Git Bash (Windows)\n\
+             - grep 不完全支持 POSIX \\| OR 语法。多词搜索请用 grep -E '(词A|词B)' 而不是 grep '词A\\|词B'\n\
+             - 路径有空格时用双引号包裹\n\
+             - && 链式调用可用，; 仅在不关心前序失败时使用\n\
+             - 用 2>/dev/null 抑制 stderr；用 >/dev/null 抑制 stdout（仅此两种重定向可用）\n\
+             - 用 working_dir 参数切换目录，不要用 cd".to_string()
+        } else {
+            "## Shell 注意：bash (Unix)\n\
+             - grep 使用 POSIX BRE 语法，\\| 表示 OR。多词搜索可用 grep -E '(词A|词B)'\n\
+             - 路径有空格时用双引号包裹\n\
+             - && 链式调用可用；; 在不关心前序失败时使用\n\
+             - 用 working_dir 参数切换目录，不要用 cd".to_string()
+        }
+    }
+}
+
+/// Shared compaction helper — used by both the error path and the normal path.
+async fn compact_conversation(
+    messages: &mut Vec<serde_json::Value>,
+    recent_commands: &mut Vec<String>,
+    client: &dyn LlmToolClient,
+) {
+    if messages.len() <= 3 {
+        return;
+    }
+    eprintln!("\r\x1b[K  \x1b[2m🗜️ 对话压缩中...\x1b[0m");
+    let keep_recent = 3usize.min(messages.len().saturating_sub(2));
+    let mut split_at = messages.len().saturating_sub(keep_recent);
+    // Don't split in the middle of an assistant/tool pair.
+    // If the first recent message is a tool result, its assistant is in older → push split back.
+    while split_at > 2 && messages[split_at].get("role").and_then(|r| r.as_str()) == Some("tool") {
+        split_at -= 1;
+    }
+    // If the last older message is an assistant with tool_calls, ensure corresponding
+    // tool results stay with it by adjusting split forward.
+    while split_at < messages.len() && split_at > 2
+        && messages[split_at - 1].get("role").and_then(|r| r.as_str()) == Some("assistant")
+        && messages[split_at - 1].get("tool_calls").is_some()
+    {
+        split_at += 1;
+    }
+    let before_tokens: usize = messages.iter()
+        .map(|m| serde_json::to_string(m).unwrap_or_default().len() / 4)
+        .sum();
+
+    let older: Vec<_> = messages[2..split_at].to_vec();
+    let recent = messages.split_off(split_at);
+
+    if older.is_empty() {
+        return;
+    }
+    let capped: Vec<_> = older.iter().take(10).cloned().collect();
+    let skipped = older.len().saturating_sub(capped.len());
+    if skipped > 0 {
+        eprintln!("\r\x1b[K  \x1b[2m  compact: capping {} older messages → {}\x1b[0m", older.len(), capped.len());
+    }
+    let compactor = ConversationCompactor::new();
+    let qe: &dyn LlmToolClient = client;
+    match compactor.compact(&capped, None, qe).await {
+        Ok(summary) => {
+            let commands_note = if recent_commands.is_empty() {
+                String::new()
+            } else {
+                let mut note = String::from("\n\n[已执行的命令 — 不要重复执行，这些探索已完成]\n");
+                for (i, cmd) in recent_commands.iter().enumerate() {
+                    note.push_str(&format!("{}. {}\n", i + 1, cmd));
+                }
+                recent_commands.clear();
+                note
+            };
+
+            let mut new_messages = vec![messages[0].clone(), messages[1].clone()];
+            new_messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!("[对话上下文摘要]\n{}{}", summary, commands_note),
+            }));
+            new_messages.extend(recent);
+            let after_tokens: usize = new_messages.iter()
+                .map(|m| serde_json::to_string(m).unwrap_or_default().len() / 4)
+                .sum();
+            *messages = new_messages;
+            eprintln!("\r\x1b[K  \x1b[2m🗜️ 压缩完成 ({} turns, {}→{} tokens)\x1b[0m", older.len(), before_tokens, after_tokens);
+        }
+        Err(e) => {
+            eprintln!("\r\x1b[K  \x1b[2m⚠ compact failed: {}\x1b[0m", e);
+        }
+    }
 }
 
 /// Check if a usable bash (with full Unix tools) is available.
-/// Mirrors the logic in execute_shell::discover_shell().
 fn has_usable_bash() -> bool {
     #[cfg(target_os = "windows")]
     {
-        // Same hardcoded paths as discover_shell()
         let known = [
             r"C:\Program Files\Git\bin\bash.exe",
             r"C:\msys64\usr\bin\bash.exe",
@@ -426,7 +433,6 @@ fn has_usable_bash() -> bool {
         if known.iter().any(|p| std::path::Path::new(p).exists()) {
             return true;
         }
-        // PATH scan: skip usr\bin bash (no grep/awk), accept bin/bash
         if let Ok(path) = std::env::var("PATH") {
             for dir in std::env::split_paths(&path) {
                 let p = dir.join("bash.exe");

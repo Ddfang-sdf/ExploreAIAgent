@@ -335,3 +335,53 @@ fn cf_015_no_exploration_section_uses_defaults() {
     assert!(config.exploration.token_threshold > 0, "token_threshold 应有默认值");
     assert!(config.exploration.token_target_ratio > 0.0, "token_target_ratio 应有默认值");
 }
+
+// CF-016: tools 段从 YAML 读取配置
+#[test]
+fn cf_016_tools_section_from_yaml() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = "\
+llm:\n  api_key: sk-test\n\
+tools:\n  shell_timeout_secs: 60\n  shell_max_output_bytes: 2048\n  shell_max_output_lines: 200\n";
+    let path = write_config(&dir, yaml);
+    let config = AppConfig::load(Some(&path)).expect("tools 段应正常加载");
+    assert_eq!(config.tools.shell_timeout_secs, 60);
+    assert_eq!(config.tools.shell_max_output_bytes, 2048);
+    assert_eq!(config.tools.shell_max_output_lines, 200);
+}
+
+// CF-017: tools 段不存在使用默认值
+#[test]
+fn cf_017_no_tools_section_uses_defaults() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(&dir, "llm:\n  api_key: sk-test\n");
+    let config = AppConfig::load(Some(&path)).expect("无 tools 段应正常加载");
+    assert!(config.tools.shell_timeout_secs > 0, "shell_timeout_secs 应有默认值");
+    assert!(config.tools.shell_max_output_bytes > 0, "shell_max_output_bytes 应有默认值");
+    assert!(config.tools.shell_max_output_lines > 0, "shell_max_output_lines 应有默认值");
+}
+
+// CF-018: llm 段 context_limit / max_output_tokens 从 YAML 读取
+#[test]
+fn cf_018_llm_context_limits_from_yaml() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = "llm:\n  api_key: sk-test\n  context_limit: 65536\n  max_output_tokens: 4096\n";
+    let path = write_config(&dir, yaml);
+    let config = AppConfig::load(Some(&path)).expect("llm 段应正常加载");
+    assert_eq!(config.llm.context_limit, Some(65536));
+    assert_eq!(config.llm.max_output_tokens, Some(4096));
+}
+
+// CF-019: llm 段未设 context_limit / max_output_tokens 时为 None
+#[test]
+fn cf_019_llm_context_limits_default_none() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(&dir, "llm:\n  api_key: sk-test\n");
+    let config = AppConfig::load(Some(&path)).expect("llm 段应正常加载");
+    assert_eq!(config.llm.context_limit, None, "未设置时应为 None");
+    assert_eq!(config.llm.max_output_tokens, None, "未设置时应为 None");
+}

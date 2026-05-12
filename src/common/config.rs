@@ -11,12 +11,12 @@ use serde::Deserialize;
 fn default_api_mode() -> String { "chat".to_string() }
 fn default_base_url() -> String { "https://api.deepseek.com/v1".to_string() }
 fn default_model() -> String { "deepseek-chat".to_string() }
-fn default_max_retries() -> usize { 3 }
+fn default_max_retries() -> usize { 10 }
 fn default_thinking() -> bool { false }
 
 fn default_token_threshold() -> usize { 12000 }
 fn default_token_target_ratio() -> f64 { 0.40 }
-fn default_refiner_summary_ratio() -> f64 { 0.10 }
+fn default_refiner_summary_ratio() -> f64 { 0.25 }
 fn default_max_tool_calls() -> usize { 75 }
 fn default_loop_warning_threshold() -> usize { 3 }
 
@@ -25,6 +25,7 @@ fn default_conv_token_threshold() -> usize { 2000 }
 
 fn default_shell_timeout() -> u32 { 30 }
 fn default_shell_max_output() -> usize { 10240 }
+fn default_shell_max_lines() -> usize { 500 }
 
 fn default_record_max_chars() -> usize { 8000 }
 fn default_min_remaining() -> usize { 5 }
@@ -86,6 +87,16 @@ pub struct LlmConfig {
 
     #[serde(default = "default_thinking")]
     pub thinking: bool,
+
+    /// Model total context window in tokens (e.g., 128000 for DeepSeek V3).
+    /// Used to calculate the auto-compact trigger: `context_limit - max_output_tokens - 20000`.
+    /// If not set, fall back to a round-based threshold.
+    #[serde(default)]
+    pub context_limit: Option<usize>,
+
+    /// Model max output tokens. If not set, defaults to 8192.
+    #[serde(default)]
+    pub max_output_tokens: Option<usize>,
 }
 
 impl Default for LlmConfig {
@@ -97,6 +108,8 @@ impl Default for LlmConfig {
             model: default_model(),
             max_retries: default_max_retries(),
             thinking: default_thinking(),
+            context_limit: None,
+            max_output_tokens: None,
         }
     }
 }
@@ -111,6 +124,12 @@ pub struct ExplorationConfig {
 
     #[serde(default = "default_refiner_summary_ratio")]
     pub refiner_summary_token_ratio: f64,
+
+    /// Override the formula-based compact threshold. When set, compaction triggers
+    /// at this token count regardless of context_limit/max_output_tokens.
+    /// When None (default), threshold = context_limit - max_output_tokens - 20000.
+    #[serde(default)]
+    pub compact_token_threshold: Option<usize>,
 }
 
 impl Default for ExplorationConfig {
@@ -119,6 +138,7 @@ impl Default for ExplorationConfig {
             token_threshold: default_token_threshold(),
             token_target_ratio: default_token_target_ratio(),
             refiner_summary_token_ratio: default_refiner_summary_ratio(),
+            compact_token_threshold: None,
         }
     }
 }
@@ -142,6 +162,18 @@ pub struct DeepExplorerConfig {
 }
 
 fn default_enable() -> bool { true }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FastExploreConfig {
+    #[serde(default = "default_enable")]
+    pub enable: bool,
+}
+
+impl Default for FastExploreConfig {
+    fn default() -> Self {
+        FastExploreConfig { enable: true }
+    }
+}
 
 impl Default for DeepExplorerConfig {
     fn default() -> Self {
@@ -180,6 +212,9 @@ pub struct ToolsConfig {
 
     #[serde(default = "default_shell_max_output")]
     pub shell_max_output_bytes: usize,
+
+    #[serde(default = "default_shell_max_lines")]
+    pub shell_max_output_lines: usize,
 }
 
 impl Default for ToolsConfig {
@@ -187,6 +222,7 @@ impl Default for ToolsConfig {
         ToolsConfig {
             shell_timeout_secs: default_shell_timeout(),
             shell_max_output_bytes: default_shell_max_output(),
+            shell_max_output_lines: default_shell_max_lines(),
         }
     }
 }
@@ -235,6 +271,9 @@ pub struct AppConfig {
     pub deep_explorer: DeepExplorerConfig,
 
     #[serde(default)]
+    pub fast_explore: FastExploreConfig,
+
+    #[serde(default)]
     pub conversation: ConversationConfig,
 
     #[serde(default)]
@@ -257,14 +296,15 @@ pub struct AppConfig {
 impl AppConfig {
     pub fn load(config_path: Option<&str>) -> Result<AppConfig, String> {
         // Step 1: determine config file path
+        // Priority: explicit path > env var > ./config.yaml > ./config.yml > defaults
         let path = if let Some(p) = config_path {
             p.to_string()
+        } else if let Ok(env_path) = env::var("EXPLORE_CONFIG_PATH") {
+            env_path
         } else if Path::new("./config.yaml").exists() {
             "./config.yaml".to_string()
         } else if Path::new("./config.yml").exists() {
             "./config.yml".to_string()
-        } else if let Ok(env_path) = env::var("EXPLORE_CONFIG_PATH") {
-            env_path
         } else {
             // No config file — use all defaults
             return Ok(AppConfig::default());

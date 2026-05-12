@@ -1,4 +1,4 @@
-use explore_ai_agent::common::config::DeepExplorerConfig;
+use explore_ai_agent::common::config::{DeepExplorerConfig, FastExploreConfig};
 use explore_ai_agent::context::exploration::ExplorationContextTool;
 use explore_ai_agent::orchestrator::orchestrator::{Orchestrator, ShellExec};
 use explore_ai_agent::agents::main_agent::ShellExecutor;
@@ -12,7 +12,7 @@ fn make_orchestrator() -> Orchestrator {
     let adapter = Arc::new(ApiAdapter::new(ApiMode::Chat));
     let registry = Arc::new(ToolRegistry::new(PathBuf::from(".")));
     let cm = ConversationManager::new(ApiAdapter::new(ApiMode::Chat));
-    Orchestrator::new(adapter, registry, cm, DeepExplorerConfig::default())
+    Orchestrator::new(adapter, registry, cm, DeepExplorerConfig::default(), FastExploreConfig::default())
 }
 
 fn make_ect() -> ExplorationContextTool {
@@ -28,7 +28,7 @@ fn make_ect() -> ExplorationContextTool {
 async fn or_001_normal_flow() {
     let orch = make_orchestrator();
     let mut ect = make_ect();
-    let result = orch.run("你好", "", Arc::new(ect)).await.map(|(a, _)| a);
+    let result = orch.run("你好", "", Arc::new(ect)).await;
     // stub: 实现后 MainAgent 直接 answer → Orchestrator 返回答案
     assert!(result.is_err(), "stub 占位，实现后应返回 Ok(答案)");
 }
@@ -38,7 +38,7 @@ async fn or_001_normal_flow() {
 async fn or_002_main_agent_failure() {
     let orch = make_orchestrator();
     let mut ect = make_ect();
-    let result = orch.run("test", "", Arc::new(ect)).await.map(|(a, _)| a);
+    let result = orch.run("test", "", Arc::new(ect)).await;
     // stub: MainAgent::run() 返回 Err → Orchestrator 透传错误
     assert!(result.is_err(), "stub 占位，实现后 MainAgent 失败应返回 Err");
 }
@@ -48,7 +48,7 @@ async fn or_002_main_agent_failure() {
 async fn or_003_cm_save_failure_does_not_block() {
     let orch = make_orchestrator();
     let mut ect = make_ect();
-    let result = orch.run("test", "", Arc::new(ect)).await.map(|(a, _)| a);
+    let result = orch.run("test", "", Arc::new(ect)).await;
     // stub: MainAgent 正常，CM 保存失败 → run() 仍返回 Ok
     assert!(result.is_err(), "stub 占位，实现后 CM 失败不阻塞答案返回");
 }
@@ -65,7 +65,7 @@ async fn or_004_shell_exec_normal() {
     // → Ok(ToolOutput{data: {"output":"...","success":true}})
     let registry = Arc::new(ToolRegistry::new(PathBuf::from(".")));
     let exec = ShellExec { registry };
-    let result = exec.execute("find . -name '*.rs' | wc -l").await.map(|(a, _)| a);
+    let result = exec.execute("find . -name '*.rs' | wc -l").await;
     // execute_shell 返回: {success, output, error}
     assert!(result.is_ok(), "ShellExec must return Ok for allowed command");
     let data = result.unwrap();
@@ -82,7 +82,7 @@ async fn or_005_shell_exec_failure() {
     // ToolRegistry 拦截不允许的命令 → Err(ToolError)
     let registry = Arc::new(ToolRegistry::new(PathBuf::from(".")));
     let exec = ShellExec { registry };
-    let result = exec.execute("rm -rf /").await.map(|(a, _)| a);
+    let result = exec.execute("rm -rf /").await;
     // 不允许的命令应返回 Err
     assert!(result.is_err(), "ShellExec must return Err for disallowed command");
 }
@@ -95,7 +95,7 @@ async fn or_005_shell_exec_failure() {
 async fn or_006_shell_echo_end_to_end() {
     let registry = Arc::new(ToolRegistry::new(PathBuf::from(".")));
     let exec = ShellExec { registry };
-    let result = exec.execute("echo hello_from_shell").await.map(|(a, _)| a);
+    let result = exec.execute("echo hello_from_shell").await;
     assert!(result.is_ok(), "echo must succeed, got: {:?}", result.err());
     let data = result.unwrap();
     assert!(data.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -110,7 +110,7 @@ async fn or_007_shell_error_propagates_to_llm() {
     // Verify that error messages contain actionable info for the LLM
     let registry = Arc::new(ToolRegistry::new(PathBuf::from(".")));
     let exec = ShellExec { registry };
-    let result = exec.execute("python -c 'print(1)'").await.map(|(a, _)| a);
+    let result = exec.execute("python -c 'print(1)'").await;
     // python is not in whitelist → should fail with useful error
     assert!(result.is_err(), "disallowed command must return Err");
     let err_msg = result.unwrap_err();
@@ -125,7 +125,7 @@ async fn or_008_shell_execute_safe_pipeline() {
     let registry = Arc::new(ToolRegistry::new(PathBuf::from(".")));
     let exec = ShellExec { registry };
     // Pipe between two allowed commands
-    let result = exec.execute("echo hello | grep hello").await.map(|(a, _)| a);
+    let result = exec.execute("echo hello | grep hello").await;
     assert!(result.is_ok(), "safe pipe must succeed, got: {:?}", result.err());
     let data = result.unwrap();
     assert!(data.get("success").and_then(|v| v.as_bool()).unwrap_or(false));

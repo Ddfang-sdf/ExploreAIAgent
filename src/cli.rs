@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::adapter::api_adapter::{ApiAdapter, ApiMode};
+use crate::adapter::model::{ModelAdapter, OpenAiChatAdapter};
 use crate::common::config::AppConfig;
 use crate::context::exploration::ExplorationContextTool;
 use crate::conversation::manager::ConversationManager;
@@ -18,20 +19,31 @@ pub struct CoreModules {
 }
 
 pub fn assemble_core(config: &AppConfig) -> Result<CoreModules, String> {
-    let adapter = Arc::new(ApiAdapter::from_config(&config.llm));
+    let mut adapter = ApiAdapter::from_config(&config.llm);
+    let model_adapter: std::sync::Arc<dyn ModelAdapter> = std::sync::Arc::new(
+        OpenAiChatAdapter::new("minimax")
+            .with_thinking(config.llm.thinking)
+            .with_reasoning_split(true)
+    );
+    adapter.model_adapter = Some(model_adapter.clone());
+    let adapter = Arc::new(adapter);
 
     let workspace = PathBuf::from(&config.workspace.path);
     let registry = Arc::new(ToolRegistry::new(workspace));
 
     let conversation_manager = ConversationManager::new(ApiAdapter::new(ApiMode::Chat));
 
-    let orchestrator = Orchestrator::from_config(
+    let mut orchestrator = Orchestrator::from_config(
         adapter.clone(),
         registry.clone(),
         ConversationManager::new(ApiAdapter::new(ApiMode::Chat)),
         &config.exploration,
         &config.deep_explorer,
+        &config.fast_explore,
     );
+    orchestrator.shell_output_lines = config.tools.shell_max_output_lines;
+    orchestrator.shell_output_bytes = config.tools.shell_max_output_bytes;
+    orchestrator.model_adapter = Some(model_adapter);
 
     Ok(CoreModules {
         adapter,
@@ -66,7 +78,8 @@ pub async fn run_cli_with_io<R: BufRead, W: Write>(
         writer.flush().map_err(|e| e.to_string())?;
 
         line.clear();
-        reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        let n = reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        if n == 0 { break; } // EOF (pipe closed)
         let input = line.trim().to_string();
 
         if input.is_empty() { continue; }

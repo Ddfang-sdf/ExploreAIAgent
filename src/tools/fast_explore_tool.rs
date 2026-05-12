@@ -71,8 +71,8 @@ impl FastExploreTool {
             });
             let history = ect.get_history();
             let recent_records: Vec<_> = history.into_iter().rev().take(15).collect();
-            let threshold = crate::context::exploration::EXPLORATION_TOKEN_THRESHOLD;
-            let target = ((threshold as f64) * 0.10_f64).max(300.0) as usize;
+            let threshold = ect.token_threshold();
+            let target = ((threshold as f64) * ect.refiner_summary_ratio()).max(300.0) as usize;
 
             let refiner = ExplorationRefinerAgent::new();
             if let Ok(new_summary) = refiner

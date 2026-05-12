@@ -51,7 +51,8 @@ impl ApiAdapter {
                         continue;
                     }
                 };
-                tool_calls.push(ToolCallInfo { name, arguments });
+                let id = tc.get("id").and_then(|i| i.as_str()).map(String::from);
+                tool_calls.push(ToolCallInfo { id, name, arguments });
             }
         }
 
@@ -103,7 +104,8 @@ impl ApiAdapter {
                             continue;
                         }
                     };
-                    tool_calls.push(ToolCallInfo { name, arguments });
+                    let id = item.get("call_id").and_then(|i| i.as_str()).map(String::from);
+                tool_calls.push(ToolCallInfo { id, name, arguments });
                 }
                 "message" => {
                     if let Some(content) = item.get("content").and_then(|c| c.as_array()) {

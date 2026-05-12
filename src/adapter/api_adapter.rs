@@ -1,3 +1,5 @@
+use crate::adapter::model::ModelAdapter;
+
 pub(crate) const MAX_RETRIES: usize = 3;
 
 // ---------------------------------------------------------------------------
@@ -38,6 +40,7 @@ pub struct ApiAdapter {
     pub(crate) api_key: String,
     pub(crate) model: String,
     pub(crate) thinking: bool,
+    pub(crate) model_adapter: Option<std::sync::Arc<dyn ModelAdapter>>,
 }
 
 impl ApiAdapter {
@@ -49,6 +52,7 @@ impl ApiAdapter {
             api_key: String::new(),
             model: String::new(),
             thinking: false,
+            model_adapter: None,
         }
     }
 
@@ -64,6 +68,7 @@ impl ApiAdapter {
             api_key: config.api_key.clone(),
             model: config.model.clone(),
             thinking: config.thinking,
+            model_adapter: None,
         }
     }
 
@@ -128,13 +133,18 @@ impl LlmStructuredClient for ApiAdapter {
             let raw = match raw_response {
                 Ok(r) => r,
                 Err(e) => {
-                    if retry_count < self.max_retries {
+                    let retry_after = super::retry::parse_error_retry_after(&e);
+                    if retry_count < super::retry::MAX_HTTP_RETRIES {
                         retry_count += 1;
+                        let delay = super::retry::retry_delay(retry_count - 1, retry_after);
+                        let label = if retry_after.is_some() { "rate-limit" } else { "transient" };
+                        eprintln!("[WARN:structured] {} retry {}/{} after {}ms", label, retry_count, super::retry::MAX_HTTP_RETRIES, delay.as_millis());
+                        tokio::time::sleep(delay).await;
                         continue;
                     }
                     return Err(format!(
                         "LLM call failed after {} retries: {}",
-                        self.max_retries, e
+                        super::retry::MAX_HTTP_RETRIES, super::retry::strip_retry_prefix(&e)
                     ));
                 }
             };
@@ -197,7 +207,6 @@ impl LlmToolClient for ApiAdapter {
 }
 
 // Re-export all public types so that `use adapter::api_adapter::*` still works.
-pub use super::data_provider::DataProvider;
 pub use super::types::{
     ApiMode, ExplorationHistoryData, OutputSchema, ToolCallInfo, ToolDefinition,
     UnifiedResponse, CHAT_TOOL_CALL_FORMAT, RESPONSES_TOOL_CALL_FORMAT,

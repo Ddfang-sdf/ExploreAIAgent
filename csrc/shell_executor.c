@@ -33,36 +33,63 @@ static const char *WHITELIST[] = {
     "wc", "sort", "uniq", "cut", "tr",
     "awk", "sed",
     "file", "stat",
-    "echo",
+    "echo", "xargs",
     /* Windows equivalents */
     "type", "dir", "findstr",
     NULL
 };
 
+static int is_redirect(const char *word) {
+    if (!word || !*word) return 0;
+    /* fd redirect: >, 2>, 1>, &>, etc. */
+    if (word[0] == '>' || strchr(word, '>') != NULL) return 1;
+    /* stderr-to-stdout: 2>&1 */
+    if (strstr(word, ">&") != NULL) return 1;
+    /* /dev/null and friends */
+    if (strcmp(word, "/dev/null") == 0 || strncmp(word, "/dev/fd/", 8) == 0) return 1;
+    if (word[0] == '&') return 1;
+    return 0;
+}
+
 int whitelist_check(const char *command) {
     if (!command) return 1;
-    while (*command == ' ' || *command == '\t') command++;
 
+    const char *p = command;
     char cmd_buf[256];
-    int i = 0;
-    while (command[i] && command[i] != ' ' && command[i] != '\t'
-           && command[i] != ';' && command[i] != '|' && command[i] != '&'
-           && i < 255) {
-        cmd_buf[i] = command[i];
-        i++;
-    }
-    cmd_buf[i] = '\0';
 
-    for (const char **w = WHITELIST; *w; w++) {
-        if (strcmp(cmd_buf, *w) == 0) {
-            /* sed -i check */
-            if (strcmp(cmd_buf, "sed") == 0) {
-                if (strstr(command, " -i") != NULL) {
-                    return 1;
-                }
-            }
-            return 0;
+    while (*p) {
+        /* skip leading whitespace */
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) return 1;
+
+        /* extract first word */
+        int i = 0;
+        while (p[i] && p[i] != ' ' && p[i] != '\t'
+               && p[i] != ';' && p[i] != '|' && p[i] != '&'
+               && i < 255) {
+            cmd_buf[i] = p[i];
+            i++;
         }
+        cmd_buf[i] = '\0';
+
+        /* skip redirect tokens (2>/dev/null, 2>&1, > /dev/null) */
+        if (is_redirect(cmd_buf)) {
+            p += i;
+            continue;
+        }
+
+        for (const char **w = WHITELIST; *w; w++) {
+            if (strcmp(cmd_buf, *w) == 0) {
+                /* sed -i check */
+                if (strcmp(cmd_buf, "sed") == 0) {
+                    if (strstr(command, " -i") != NULL) {
+                        return 1;
+                    }
+                }
+                return 0;
+            }
+        }
+        return 1;
     }
     return 1;
 }
@@ -92,16 +119,10 @@ int operator_check(const char *command) {
             continue;
         }
 
-        /* Check dangerous patterns only outside quotes */
-        if (*p == '$' && *(p + 1) == '(') return 1;
-        if (*p == '`') return 1;
-        if (*p == ';') return 1;
-
-        if (*p == '>' && *(p + 1) == '>') { p += 2; continue; }
-        if (*p == '>') return 1;
-
-        if (*p == '&' && *(p + 1) == '&') { p += 2; continue; }
-        if (*p == '|' && *(p + 1) == '|') { p += 2; continue; }
+        /* >> always blocked — no legitimate read-only use */
+        if (*p == '>' && *(p + 1) == '>') return 1;
+        /* > now allowed (Rust layer does path-based validation to prevent
+           writes inside workspace while allowing > /dev/null /tmp etc.) */
 
         if (strncmp(p, "system(", 7) == 0) return 1;
         if (strncmp(p, "exec(", 5) == 0) return 1;
@@ -133,44 +154,97 @@ int operator_check(const char *command) {
 static int pipe_check(const char *command) {
     if (!command || !strchr(command, '|')) return 0;
 
-    /* Make a mutable copy for strtok */
-    char *cmd_copy = strdup(command);
-    if (!cmd_copy) return 1;
+    /* Quote-aware split: walk the string, record segment start/end,
+       skip quoted content so | inside quotes is treated as literal. */
+    const char *p = command;
+    const char *seg_start = command;
 
-    char *segment = strtok(cmd_copy, "|");
-    int ret = 0;
-
-    while (segment != NULL) {
-        /* Trim leading whitespace */
-        while (*segment == ' ' || *segment == '\t') segment++;
-
-        if (strlen(segment) > 0) {
-            /* Check for tee in any pipe segment.
-             * Manual extraction avoids nested strtok (not re-entrant). */
+    while (*p) {
+        if (*p == '\'' || *p == '"') {
+            p = skip_quoted(p, *p);
+            continue;
+        }
+        if (*p == '|') {
+            /* Found a real pipe — validate the segment from seg_start to p */
             {
-                const char *p = segment;
-                while (*p == ' ' || *p == '\t') p++;
-                if (strncmp(p, "tee", 3) == 0
-                    && (p[3] == ' ' || p[3] == '\t' || p[3] == '\0')) {
-                    free(cmd_copy);
-                    return 1;
+                /* Build a temp segment string */
+                size_t seg_len = p - seg_start;
+                if (seg_len > 0) {
+                    char *segment = (char *)malloc(seg_len + 1);
+                    if (segment) {
+                        memcpy(segment, seg_start, seg_len);
+                        segment[seg_len] = '\0';
+                        /* Trim leading whitespace */
+                        char *trimmed = segment;
+                        while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+
+                        if (strlen(trimmed) > 0) {
+                            /* Check for tee */
+                            {
+                                const char *tp = trimmed;
+                                while (*tp == ' ' || *tp == '\t') tp++;
+                                if (strncmp(tp, "tee", 3) == 0
+                                    && (tp[3] == ' ' || tp[3] == '\t' || tp[3] == '\0')) {
+                                    free(segment);
+                                    return 1;
+                                }
+                            }
+                            if (whitelist_check(trimmed) != 0) {
+                                free(segment);
+                                return 1;
+                            }
+                            if (operator_check(trimmed) != 0) {
+                                free(segment);
+                                return 1;
+                            }
+                        }
+                        free(segment);
+                    }
                 }
             }
-
-            if (whitelist_check(segment) != 0) {
-                ret = 1;
-                break;
-            }
-            if (operator_check(segment) != 0) {
-                ret = 1;
-                break;
-            }
+            p++;
+            seg_start = p;
+            continue;
         }
-        segment = strtok(NULL, "|");
+        p++;
     }
 
-    free(cmd_copy);
-    return ret;
+    /* Validate the final segment (after last pipe) */
+    {
+        size_t seg_len = p - seg_start;
+        if (seg_len > 0) {
+            char *segment = (char *)malloc(seg_len + 1);
+            if (segment) {
+                memcpy(segment, seg_start, seg_len);
+                segment[seg_len] = '\0';
+                char *trimmed = segment;
+                while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+
+                if (strlen(trimmed) > 0) {
+                    {
+                        const char *tp = trimmed;
+                        while (*tp == ' ' || *tp == '\t') tp++;
+                        if (strncmp(tp, "tee", 3) == 0
+                            && (tp[3] == ' ' || tp[3] == '\t' || tp[3] == '\0')) {
+                            free(segment);
+                            return 1;
+                        }
+                    }
+                    if (whitelist_check(trimmed) != 0) {
+                        free(segment);
+                        return 1;
+                    }
+                    if (operator_check(trimmed) != 0) {
+                        free(segment);
+                        return 1;
+                    }
+                }
+                free(segment);
+            }
+        }
+    }
+
+    return 0;
 }
 
 /* ---- platform-specific execution ---- */

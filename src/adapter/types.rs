@@ -14,6 +14,7 @@ impl Default for ApiMode {
 
 #[derive(Debug, Clone)]
 pub struct ToolCallInfo {
+    pub id: Option<String>,
     pub name: String,
     pub arguments: serde_json::Value,
 }
