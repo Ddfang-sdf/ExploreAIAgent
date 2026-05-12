@@ -1,15 +1,15 @@
 # Explore AI Agent
 
-基于大语言模型的代码库智能探索代理。给定一个本地项目目录，Agent 自动搜索、阅读和分析代码，回答用户关于代码库的任何问题。
+基于 LLM 的代码库智能探索代理。给定一个本地项目目录，Agent 自主搜索、阅读和分析代码，回答关于代码库的任何问题。
 
-**核心思路**：快速探索（关键词搜索）定位关键文件 → 深度探索（LLM 自主调用工具）收集原始代码证据 → 质量评估 → 生成准确回答。全程自动，用户只需提问。
+**核心**：MainAgent 通过 function-calling 调用 8 个工具探索代码库，SSE 流式输出思考过程，OpenCode 风格上下文精炼。
 
 ## 快速开始
 
 ### 环境要求
 
-- Rust 1.80+
-- DeepSeek API Key（[申请地址](https://platform.deepseek.com/)）
+- Rust 1.80+ （需 MSVC 工具链用于编译 C 模块）
+- LLM API Key（兼容 OpenAI 接口的任意厂商，支持 MiniMax / DeepSeek）
 
 ### 安装
 
@@ -21,8 +21,6 @@ cargo build --release
 
 ### 配置
 
-复制模板文件并填入你的 API Key：
-
 ```bash
 cp config.template.yaml config.yaml
 ```
@@ -31,107 +29,117 @@ cp config.template.yaml config.yaml
 
 ```yaml
 llm:
-  api_mode: "chat"
-  base_url: "https://api.deepseek.com/v1"
-  api_key: "sk-your-key-here"
-  model: "deepseek-v4-pro"
-  max_retries: 3
-  thinking: false
+  api_key: "sk-your-key"
+  base_url: "https://api.minimaxi.com/v1"   # 或 https://api.deepseek.com/v1
+  model: "MiniMax-M2.7"                      # 或 deepseek-chat
+  thinking: true                             # MiniMax 思考模式
 
 exploration:
-  token_threshold: 12000
-  max_fast_explore_rounds: 3
-  early_termination_confidence: 0.8
+  compact_token_threshold: 10000             # 压缩触发阈值
+
+deep_explorer:
+  enable: true                               # 深度探索子代理
+  max_tool_calls: 75
+
+fast_explore:
+  enable: true                               # 快速关键词扫描
 
 workspace:
-  path: "./workspace"
+  path: "./workspace"                        # 待探索项目目录
 ```
 
 ### 运行
 
-将你要探索的项目放到 `workspace/` 目录下，然后：
-
 ```bash
+# CLI 模式
 cargo run --release
+
+# Web 模式（axum HTTP 服务）
+cargo run --release -- --web
+# 服务启动在 http://localhost:3000
 ```
 
-CLI 交互模式启动后，直接输入问题：
+CLI 交互：
 
 ```
->>> 这个项目是做什么的？核心结构是什么样的？
->>> 回测功能是怎么验证策略效果的？
+>>> 这个项目是做什么的？
+>>> 回测功能怎么实现？
 >>> /exit
 ```
 
-## 工作原理
+## Web API
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/health` | GET | 健康检查 |
+| `/chat` | POST | 单次问答（JSON 响应） |
+| `/chat/stream` | POST | 流式问答（SSE，实时推送思考过程） |
+
+请求格式：
+
+```json
+{"question": "项目怎么回测？", "session_id": "可选"}
+```
+
+## 架构
 
 ```
-用户问题
-  │
-  ▼
-SearchStrategyAgent（快速探索，最多 3 轮）
-  │ LLM 设计关键词 → FastExplorer 批量搜索 → LLM 评估结果
-  │
-  ▼
-ExplorationQualityEvaluator（质量评估）
-  │ 评估探索数据是否足以回答问题
-  │
-  ├── 置信度高 → 直接回答
-  │
-  └── 置信度低 → DeepExplorer（深度探索，最多 75 次工具调用）
-       │ LLM 自主决定调用 6 种只读工具
-       │ search_content / search_files / read_file /
-       │ list_dir / file_info / execute_shell
+MainAgent（决策中心，LLM function-calling 自主选择工具）
+  ├── search_content    # 正则搜索文件内容
+  ├── search_files      # Glob 文件名搜索
+  ├── read_file         # 读取文件内容
+  ├── list_dir          # 列出目录
+  ├── file_info         # 文件元信息
+  ├── execute_shell     # 只读 Shell
+  ├── fast_explore      # 关键词批量搜索（可选）
+  └── deep_explore      # 子代理深度探索（可选）
        │
        ▼
-    MainAgent（基于全部探索证据生成回答）
+  基于探索数据生成最终答案
 ```
 
-## 可用工具
+**模型适配层**：`ModelAdapter` trait 屏蔽 OpenAI Chat / Anthropic Messages API 差异，支持 MiniMax / DeepSeek 等模型。
 
-| 工具 | 功能 |
-|------|------|
-| `search_files` | 按 glob 模式搜索文件名 |
-| `search_content` | 正则搜索文件内容 |
-| `read_file` | 读取文件（支持行范围） |
-| `list_dir` | 列出目录 |
-| `file_info` | 文件元信息 + 代码统计 |
-| `execute_shell` | 受限只读 Shell 命令 |
-| `fast_explorer` | 批量关键词搜索（多关键词 OR） |
+**思考过程**：SSE 流式解析 `reasoning_details` / `reasoning` / `reasoning_text` / `<think>` 标签，实时展示。
 
-## 项目结构
-
-```
-src/
-├── adapter/          # LLM API 适配层（Chat/Responses 双模式）
-├── agents/           # 5 个 Agent + 2 个 Refiner
-│   ├── search_strategy.rs    # 快速探索策略
-│   ├── deep_explorer.rs      # 深度自主探索
-│   ├── quality_evaluator.rs  # 探索质量评估
-│   ├── main_agent.rs         # 最终回答生成
-│   ├── exploration_refiner.rs # 探索上下文精炼
-│   └── conversation_refiner.rs # 对话上下文精炼
-├── common/           # 错误类型、配置管理、路径安全
-├── context/          # 探索上下文与对话上下文存储
-├── conversation/     # 多轮对话管理
-├── fast_explorer/    # 批量关键词搜索引擎
-├── ffi_bridge/       # C 语言 Shell 执行器 FFI
-├── orchestrator/     # 核心流程编排
-├── tools/            # 7 个底层只读工具
-└── web/              # Web 服务（开发中）
-```
+**上下文精炼**：OpenCode SUMMARY_TEMPLATE 原版模板，工具输出 2000 字符截断，assistant/tool 配对保护。
 
 ## 配置说明
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `llm.api_mode` | `chat` | API 模式：`chat` 或 `responses` |
-| `llm.base_url` | `https://api.deepseek.com/v1` | LLM API 地址 |
-| `llm.model` | `deepseek-v4-pro` | 模型名称 |
-| `llm.thinking` | `false` | 是否开启思考模式 |
-| `exploration.max_fast_explore_rounds` | `3` | 快速探索最大轮次 |
-| `exploration.token_threshold` | `12000` | 探索上下文精炼触发阈值 |
+| `llm.api_key` | — | **必填** |
+| `llm.base_url` | `https://api.deepseek.com/v1` | API 地址 |
+| `llm.model` | `deepseek-chat` | 模型名称 |
+| `llm.thinking` | `false` | MiniMax 思考模式 |
+| `exploration.compact_token_threshold` | `8000` | 压缩触发 token 数 |
+| `deep_explorer.enable` | `true` | 是否启用深度探索 |
+| `deep_explorer.max_tool_calls` | `75` | DE 最大工具调用次数 |
+| `fast_explore.enable` | `true` | 是否启用快速扫描 |
 | `workspace.path` | `./workspace` | 待探索项目目录 |
+
+## 项目结构
+
+```
+src/
+├── adapter/
+│   ├── model/          # 模型适配层（OpenAI Chat / Anthropic Messages）
+│   ├── api_adapter.rs  # LLM API 客户端 + Trait
+│   ├── retry.rs        # HTTP 重试（OpenCode 风格指数退避 + 抖动）
+│   ├── response.rs     # 响应解析
+│   ├── reasoning.rs    # 思考内容提取链
+│   ├── protocol.rs     # 工具结果消息构建
+│   └── types.rs        # 统一类型定义
+├── agents/             # Agent（MainAgent / DE / Compactor）
+├── common/             # 配置管理、错误类型、路径安全、截断控制
+├── context/            # 探索/对话上下文存储
+├── conversation/       # 多轮对话管理
+├── ffi_bridge/         # C 语言 Shell 执行器 FFI
+├── orchestrator/       # 模块组装 + ToolDispatcher
+├── tools/              # 底层只读工具 + Shell 安全
+└── web/                # Web API
+csrc/                   # C 层（execute_shell 核心引擎）
+```
 
 ## 许可证
 
