@@ -7,6 +7,9 @@ impl ApiAdapter {
         &self,
         raw_response: &serde_json::Value,
     ) -> Result<UnifiedResponse, String> {
+        if let Some(ref adapter) = self.model_adapter {
+            return adapter.parse_response(raw_response);
+        }
         match self.api_mode {
             ApiMode::Chat => self.parse_chat_response(raw_response),
             ApiMode::Responses => self.parse_responses_response(raw_response),

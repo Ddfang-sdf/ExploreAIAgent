@@ -205,7 +205,8 @@ impl ApiAdapter {
             return Err("LLM client not configured: api_key is empty".to_string());
         }
 
-        let url = format!("{}/chat/completions", self.base_url);
+        let api_path = self.model_adapter.as_ref().map(|a| a.api_path()).unwrap_or("/chat/completions");
+        let url = format!("{}{}", self.base_url, api_path);
         let api_key = self.api_key.clone();
 
         let body = if let Some(ref adapter) = self.model_adapter {
@@ -300,7 +301,8 @@ impl ApiAdapter {
             return Err("LLM client not configured: api_key is empty".to_string());
         }
 
-        let url = format!("{}/chat/completions", self.base_url);
+        let api_path = self.model_adapter.as_ref().map(|a| a.api_path()).unwrap_or("/chat/completions");
+        let url = format!("{}{}", self.base_url, api_path);
         let api_key = self.api_key.clone();
 
         let mut body = if let Some(ref adapter) = self.model_adapter {
@@ -340,95 +342,160 @@ impl ApiAdapter {
                 return Err(format!("LLM API error ({}): {}", status, preview));
             }
 
+            // Detect SSE format: OpenAI (choices[]) or Anthropic (content_block)
+            let is_anthropic = body_str.contains("\"content_block_start\"") || body_str.contains("\"content_block_delta\"");
+
             let mut full_content = String::new();
             let mut tool_calls_map: std::collections::BTreeMap<i32, (String, String, String)> = std::collections::BTreeMap::new();
-            // (index, id, name, arguments_json)
             let mut reasoning_parts: Vec<String> = Vec::new();
             let mut finish_reason: Option<String> = None;
 
-            for line in body_str.lines() {
-                let line = line.trim();
-                if line.is_empty() { continue; }
-                if line == "data: [DONE]" { break; }
-                if !line.starts_with("data: ") { continue; }
+            if is_anthropic {
+                // --- Anthropic SSE format ---
+                let mut current_event: Option<String> = None;
+                for line in body_str.lines() {
+                    let line = line.trim();
+                    if line.is_empty() { continue; }
+                    if line.starts_with("event: ") {
+                        current_event = Some(line[7..].to_string());
+                        continue;
+                    }
+                    if !line.starts_with("data: ") { continue; }
+                    let json_str = &line[6..];
+                    let ev: serde_json::Value = serde_json::from_str(json_str)
+                        .map_err(|e| format!("SSE parse error: {} in: {}", e, &json_str[..200.min(json_str.len())]))?;
 
-                let json_str = &line[6..];
-                let event: serde_json::Value = serde_json::from_str(json_str)
-                    .map_err(|e| format!("SSE JSON parse error: {} in: {}", e, &json_str[..200.min(json_str.len())]))?;
-
-                // Check finish_reason
-                if let Some(fr) = event["choices"][0]["finish_reason"].as_str() {
-                    finish_reason = Some(fr.to_string());
+                    let ev_type = ev["type"].as_str().unwrap_or("");
+                    match ev_type {
+                        "content_block_start" => {
+                            let cb = &ev["content_block"];
+                            let idx = ev["index"].as_i64().unwrap_or(0) as i32;
+                            match cb["type"].as_str().unwrap_or("") {
+                                "thinking" => {
+                                    if let Some(t) = cb["thinking"].as_str() {
+                                        on_reasoning(t);
+                                        reasoning_parts.push(t.to_string());
+                                    }
+                                }
+                                "tool_use" => {
+                                    let id = cb["id"].as_str().unwrap_or("").to_string();
+                                    let name = cb["name"].as_str().unwrap_or("").to_string();
+                                    let input_str = cb["input"].as_object()
+                                        .filter(|o| !o.is_empty())
+                                        .map(|o| serde_json::to_string(o).unwrap_or_default())
+                                        .unwrap_or_default();
+                                    tool_calls_map.entry(idx).or_insert_with(|| (id, name, input_str));
+                                }
+                                _ => {}
+                            }
+                        }
+                        "content_block_delta" => {
+                            let delta = &ev["delta"];
+                            let idx = ev["index"].as_i64().unwrap_or(0) as i32;
+                            match delta["type"].as_str().unwrap_or("") {
+                                "thinking_delta" => {
+                                    if let Some(t) = delta["thinking"].as_str() {
+                                        on_reasoning(t);
+                                        reasoning_parts.push(t.to_string());
+                                    }
+                                }
+                                "text_delta" => {
+                                    if let Some(t) = delta["text"].as_str() {
+                                        full_content.push_str(t);
+                                    }
+                                }
+                                "input_json_delta" => {
+                                    if let Some(entry) = tool_calls_map.get_mut(&idx) {
+                                        if let Some(j) = delta["partial_json"].as_str() {
+                                            entry.2.push_str(j);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        "message_delta" => {
+                            if let Some(sr) = ev["delta"]["stop_reason"].as_str() {
+                                finish_reason = Some(sr.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
                 }
+            } else {
+                // --- OpenAI SSE format ---
+                for line in body_str.lines() {
+                    let line = line.trim();
+                    if line.is_empty() { continue; }
+                    if line == "data: [DONE]" { break; }
+                    if !line.starts_with("data: ") { continue; }
 
-                let delta = &event["choices"][0]["delta"];
+                    let json_str = &line[6..];
+                    let event: serde_json::Value = serde_json::from_str(json_str)
+                        .map_err(|e| format!("SSE JSON parse error: {} in: {}", e, &json_str[..200.min(json_str.len())]))?;
 
-                // Reasoning deltas: MiniMax reasoning_details (array), reasoning/text (string)
-                if let Some(rd) = delta["reasoning_details"].as_array() {
-                    for item in rd {
-                        if item["type"] == "reasoning.text" {
-                            if let Some(text) = item["text"].as_str() {
-                                on_reasoning(text);
-                                reasoning_parts.push(text.to_string());
+                    if let Some(fr) = event["choices"][0]["finish_reason"].as_str() {
+                        finish_reason = Some(fr.to_string());
+                    }
+
+                    let delta = &event["choices"][0]["delta"];
+
+                    if let Some(rd) = delta["reasoning_details"].as_array() {
+                        for item in rd {
+                            if item["type"] == "reasoning.text" {
+                                if let Some(text) = item["text"].as_str() {
+                                    on_reasoning(text);
+                                    reasoning_parts.push(text.to_string());
+                                }
                             }
                         }
                     }
-                }
-                // Some models use a plain string field: `reasoning` or `reasoning_text`
-                for key in &["reasoning", "reasoning_text"] {
-                    if let Some(reason) = delta[*key].as_str() {
-                        if !reason.is_empty() {
-                            on_reasoning(reason);
-                            reasoning_parts.push(reason.to_string());
+                    for key in &["reasoning", "reasoning_text"] {
+                        if let Some(reason) = delta[*key].as_str() {
+                            if !reason.is_empty() {
+                                on_reasoning(reason);
+                                reasoning_parts.push(reason.to_string());
+                            }
                         }
                     }
-                }
-
-                // Content delta — extract embedded <think> tags (MiniMax native format)
-                if let Some(content) = delta["content"].as_str() {
-                    if !content.is_empty() {
-                        let mut remaining = content;
-                        loop {
-                            if let Some(start) = remaining.find("<think>") {
-                                // Flush text before <think> to full_content
-                                if start > 0 {
-                                    full_content.push_str(&remaining[..start]);
-                                }
-                                let after_open = &remaining[start + 7..];
-                                if let Some(end) = after_open.find("</think>") {
-                                    let think_text = &after_open[..end];
-                                    if !think_text.is_empty() {
-                                        on_reasoning(think_text);
-                                        reasoning_parts.push(think_text.to_string());
+                    if let Some(content) = delta["content"].as_str() {
+                        if !content.is_empty() {
+                            let mut remaining = content;
+                            loop {
+                                if let Some(start) = remaining.find("<think>") {
+                                    if start > 0 { full_content.push_str(&remaining[..start]); }
+                                    let after_open = &remaining[start + 7..];
+                                    if let Some(end) = after_open.find("</think>") {
+                                        let think_text = &after_open[..end];
+                                        if !think_text.is_empty() {
+                                            on_reasoning(think_text);
+                                            reasoning_parts.push(think_text.to_string());
+                                        }
+                                        remaining = &after_open[end + 8..];
+                                    } else {
+                                        let think_text = after_open;
+                                        if !think_text.is_empty() {
+                                            on_reasoning(think_text);
+                                            reasoning_parts.push(think_text.to_string());
+                                        }
+                                        break;
                                     }
-                                    remaining = &after_open[end + 8..];
                                 } else {
-                                    // <think> opened but not closed yet — buffer remainder
-                                    // as thinking (partial tag at stream boundary)
-                                    let think_text = after_open;
-                                    if !think_text.is_empty() {
-                                        on_reasoning(think_text);
-                                        reasoning_parts.push(think_text.to_string());
-                                    }
+                                    full_content.push_str(remaining);
                                     break;
                                 }
-                            } else {
-                                full_content.push_str(remaining);
-                                break;
                             }
                         }
                     }
-                }
-
-                // Tool call deltas
-                if let Some(tc_array) = delta["tool_calls"].as_array() {
-                    for tc in tc_array {
-                        let idx = tc["index"].as_i64().unwrap_or(0) as i32;
-                        let entry = tool_calls_map.entry(idx).or_insert_with(|| (String::new(), String::new(), String::new()));
-                        if let Some(id) = tc["id"].as_str() { entry.0 = id.to_string(); }
-                        if let Some(func) = tc.get("function") {
-                            if let Some(name) = func["name"].as_str() { entry.1 = name.to_string(); }
-                            if let Some(args) = func["arguments"].as_str() { entry.2.push_str(args); }
+                    if let Some(tc_array) = delta["tool_calls"].as_array() {
+                        for tc in tc_array {
+                            let idx = tc["index"].as_i64().unwrap_or(0) as i32;
+                            let entry = tool_calls_map.entry(idx).or_insert_with(|| (String::new(), String::new(), String::new()));
+                            if let Some(id) = tc["id"].as_str() { entry.0 = id.to_string(); }
+                            if let Some(func) = tc.get("function") {
+                                if let Some(name) = func["name"].as_str() { entry.1 = name.to_string(); }
+                                if let Some(args) = func["arguments"].as_str() { entry.2.push_str(args); }
+                            }
                         }
                     }
                 }

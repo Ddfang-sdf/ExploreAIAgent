@@ -1,31 +1,24 @@
 llm:
-  api_mode: "chat"
-  base_url: "https://api.deepseek.com/v1"
-  api_key: "your-deepseek-api-key"
-  model: "deepseek-v4-pro"
-  max_retries: 10
-  thinking: false
-  context_limit: 128000
-  max_output_tokens: 8192
+  api_key: "your-api-key"
+  base_url: "https://api.minimaxi.com/v1"    # 或 https://api.deepseek.com/v1
+  model: "MiniMax-M2.7"                     # 或 deepseek-chat
+  thinking: true                            # MiniMax 思考模式
+  max_retries: 2
+  # api_protocol: "anthropic"               # 可选 "openai"(默认) | "anthropic"
+  #   Anthropic 协议时 base_url 应为 https://api.minimaxi.com/anthropic
 
 exploration:
-  token_threshold: 12000
-  token_target_ratio: 0.40
-  refiner_summary_token_ratio: 0.25
-  # 直接指定压缩阈值（token数）。设了就按此值压缩，不设走公式：context_limit - max_output - 20000
-  # 对 minimax 等实际处理能力低于名义上下文窗口的模型很有用，建议 10000
-  # compact_token_threshold: 10000
+  compact_token_threshold: 10000            # 压缩触发 token 数，不设默认 8000
 
 deep_explorer:
-  enable: true
+  enable: false
   max_tool_calls: 75
   loop_warning_threshold: 3
 
 fast_explore:
-  enable: true
+  enable: false
 
 tools:
-  shell_timeout_secs: 30
   shell_max_output_bytes: 10240
   shell_max_output_lines: 500
 

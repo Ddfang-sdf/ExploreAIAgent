@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use crate::common::error::{ErrorCode, ToolError};
 use crate::common::models::{ToolInput, ToolOutput};
-use crate::context::exploration::ExplorationContextTool;
 use crate::fast_explorer::explorer::FastExplorer;
 use super::executor::ToolExecutor;
 use super::search_files::SearchFilesTool;
@@ -34,9 +33,6 @@ impl ToolRegistry {
         registry.register(Arc::new(FileInfoTool::new(project_root.clone())));
         registry.register(Arc::new(ExecuteShellTool::new(project_root.clone())));
         registry.register(Arc::new(FastExplorer::new(project_root.clone())));
-        registry.register(Arc::new(ExplorationContextTool::new(
-            "default".to_string(),
-        )));
         registry
     }
 

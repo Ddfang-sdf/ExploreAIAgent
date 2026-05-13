@@ -8,10 +8,7 @@ use tokio_stream::StreamExt;
 use explore_ai_agent::agents::main_agent::{self, SseEvent};
 use explore_ai_agent::cli;
 use explore_ai_agent::common::config::AppConfig;
-use explore_ai_agent::context::exploration::ExplorationContextTool;
 use explore_ai_agent::web::{ChatRequest, ChatResponse};
-use std::collections::HashMap;
-use std::sync::Mutex;
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
@@ -27,7 +24,6 @@ async fn main() -> Result<(), String> {
 
 struct WebState {
     core: Arc<cli::CoreModules>,
-    sessions: Arc<Mutex<HashMap<String, Arc<ExplorationContextTool>>>>,
     config: AppConfig,
 }
 
@@ -35,7 +31,6 @@ async fn run_web(config: AppConfig) -> Result<(), String> {
     let core = cli::assemble_core(&config)?;
     let state = Arc::new(WebState {
         core: Arc::new(core),
-        sessions: Arc::new(Mutex::new(HashMap::new())),
         config,
     });
 
@@ -68,16 +63,7 @@ async fn chat(
     let session_id = body.session_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string());
 
-    let ect = {
-        let mut sessions = state.sessions.lock().unwrap();
-        sessions.entry(session_id.clone()).or_insert_with(|| {
-            let mut e = ExplorationContextTool::new(session_id.clone());
-            e.configure(&state.config.exploration, &state.config.context);
-            Arc::new(e)
-        }).clone()
-    };
-
-    let resp = match state.core.orchestrator.run(&body.question, "", ect).await {
+    let resp = match state.core.orchestrator.run(&body.question, "").await {
         Ok(answer) => ChatResponse {
             code: 0, session_id, answer: Some(answer), error: None,
         },
@@ -97,22 +83,13 @@ async fn chat_stream(
     Json(body): Json<ChatRequest>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let session_id = body.session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string());
-    let ect = {
-        let mut sessions = state.sessions.lock().unwrap();
-        sessions.entry(session_id.clone()).or_insert_with(|| {
-            let mut e = ExplorationContextTool::new(session_id.clone());
-            e.configure(&state.config.exploration, &state.config.context);
-            Arc::new(e)
-        }).clone()
-    };
-
     let rx = main_agent::sse_enable();
     let q = body.question.clone();
     let core = state.core.clone();
     let sid = session_id.clone();
 
     tokio::spawn(async move {
-        let result = core.orchestrator.run(&q, "", ect).await;
+        let result = core.orchestrator.run(&q, "").await;
         let tx_opt = main_agent::SSE_TX.lock().unwrap().clone();
         if let Some(tx) = tx_opt {
             match result {

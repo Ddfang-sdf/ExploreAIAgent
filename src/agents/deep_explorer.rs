@@ -7,6 +7,12 @@ use crate::agents::conversation_compactor::ConversationCompactor;
 use crate::common::config::DeepExplorerConfig;
 use crate::tools::registry::ToolRegistry;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CriticalFileRef {
+    pub path: String,
+    pub summary: String,
+}
+
 pub const MAX_TOOL_CALLS: usize = 75;
 const TOOL_OUTPUT_MAX_CHARS: usize = 2000;
 
@@ -31,7 +37,7 @@ pub struct CollectedEvidence {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeepExplorerResult {
-    pub critical_files: Vec<super::search_strategy::CriticalFileRef>,
+    pub critical_files: Vec<CriticalFileRef>,
     pub collected_evidence: Vec<CollectedEvidence>,
     pub missing_info: String,
 }
@@ -186,6 +192,7 @@ impl DeepExplorer {
 
         let mut messages: Vec<serde_json::Value> = vec![
             serde_json::json!({"role": "system", "content": system_prompt}),
+            serde_json::json!({"role": "user", "content": format!("请探索: {}", question)}),
         ];
 
         let mut tool_call_count: usize = 0;
@@ -221,7 +228,21 @@ impl DeepExplorer {
                 eprintln!("\r\x1b[K  \x1b[2m🗜️ DE压缩中...\x1b[0m");
                 let system = messages.remove(0);
                 let keep = 3usize.min(messages.len());
-                let split = messages.len().saturating_sub(keep);
+                let mut split = messages.len().saturating_sub(keep);
+                // Don't split in the middle of an assistant/tool pair:
+                // If the first recent message is a tool result, push split back.
+                let original = split;
+                while split > 0 && messages[split].get("role").and_then(|r| r.as_str()) == Some("tool") {
+                    split -= 1;
+                }
+                // If the last older message is an assistant with tool_calls,
+                // push split forward to include its tool results (but don't exceed original).
+                while split < original && split > 0
+                    && messages[split - 1].get("role").and_then(|r| r.as_str()) == Some("assistant")
+                    && messages[split - 1].get("tool_calls").is_some()
+                {
+                    split += 1;
+                }
                 let older: Vec<_> = messages[..split].to_vec();
                 let recent = messages.split_off(split);
 
@@ -232,7 +253,9 @@ impl DeepExplorer {
                     let qe: &dyn LlmToolClient = adapter;
                     match compactor.compact(&capped, previous_summary.as_deref(), qe).await {
                         Ok(summary) => {
-                            messages = vec![system];
+                            let user_q = messages.get(1).cloned()
+                                .unwrap_or_else(|| serde_json::json!({"role": "user", "content": ""}));
+                            messages = vec![system, user_q];
                             messages.push(serde_json::json!({
                                 "role": "user",
                                 "content": format!("[上下文摘要]\n{}", summary),

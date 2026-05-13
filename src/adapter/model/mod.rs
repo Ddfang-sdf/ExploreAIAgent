@@ -30,6 +30,9 @@ pub trait ModelAdapter: Send + Sync {
     /// Extract the full assistant message from raw response.
     /// Must preserve all model-specific fields (e.g. reasoning_details for MiniMax).
     fn build_assistant_message(&self, raw: &serde_json::Value) -> Result<serde_json::Value, String>;
+
+    /// API endpoint path for this protocol (e.g. "/chat/completions", "/messages").
+    fn api_path(&self) -> &str;
 }
 
 pub use openai_chat::OpenAiChatAdapter;

@@ -133,4 +133,6 @@ impl ModelAdapter for OpenAiChatAdapter {
             .and_then(|c| c.get("message").cloned())
             .ok_or_else(|| "Missing choices[0].message in response".to_string())
     }
+
+    fn api_path(&self) -> &str { "/chat/completions" }
 }

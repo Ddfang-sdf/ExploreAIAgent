@@ -3,9 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::adapter::api_adapter::{ApiAdapter, ApiMode};
-use crate::adapter::model::{ModelAdapter, OpenAiChatAdapter};
+use crate::adapter::model::{ModelAdapter, OpenAiChatAdapter, AnthropicMessagesAdapter};
 use crate::common::config::AppConfig;
-use crate::context::exploration::ExplorationContextTool;
 use crate::conversation::manager::ConversationManager;
 use crate::orchestrator::orchestrator::Orchestrator;
 use crate::tools::registry::ToolRegistry;
@@ -20,11 +19,15 @@ pub struct CoreModules {
 
 pub fn assemble_core(config: &AppConfig) -> Result<CoreModules, String> {
     let mut adapter = ApiAdapter::from_config(&config.llm);
-    let model_adapter: std::sync::Arc<dyn ModelAdapter> = std::sync::Arc::new(
-        OpenAiChatAdapter::new("minimax")
-            .with_thinking(config.llm.thinking)
-            .with_reasoning_split(true)
-    );
+    let model_adapter: std::sync::Arc<dyn ModelAdapter> = if config.llm.api_protocol == "anthropic" {
+        std::sync::Arc::new(AnthropicMessagesAdapter::new("anthropic"))
+    } else {
+        std::sync::Arc::new(
+            OpenAiChatAdapter::new("openai")
+                .with_thinking(config.llm.thinking)
+                .with_reasoning_split(true)
+        )
+    };
     adapter.model_adapter = Some(model_adapter.clone());
     let adapter = Arc::new(adapter);
 
@@ -63,10 +66,6 @@ pub async fn run_cli_with_io<R: BufRead, W: Write>(
 
     core.conversation_manager.init_session(session_id);
 
-    let mut ect = ExplorationContextTool::new(session_id.to_string());
-    ect.configure(&config.exploration, &config.context);
-    let ect = Arc::new(ect);
-
     let mut line = String::new();
     let mut reader = reader;
 
@@ -89,7 +88,7 @@ pub async fn run_cli_with_io<R: BufRead, W: Write>(
             .map(|c| c.conversation_summary).unwrap_or_default();
 
         let t0 = std::time::Instant::now();
-        match core.orchestrator.run(&input, &ctx, ect.clone()).await {
+        match core.orchestrator.run(&input, &ctx).await {
             Ok(answer) => {
                 let elapsed = t0.elapsed().as_secs_f64();
                 eprintln!("\r\x1b[K✅ 回答完成 ({:.1}s)", elapsed);

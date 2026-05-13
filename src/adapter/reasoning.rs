@@ -37,6 +37,25 @@ impl ReasoningExtractor for ReasoningContentExtractor {
     }
 }
 
+/// MiniMax intranet (minimax-m27): `choices[0].message.reasoning` (plain string)
+pub struct ReasoningFieldExtractor;
+
+impl ReasoningExtractor for ReasoningFieldExtractor {
+    fn extract(&self, raw: &Value) -> Option<String> {
+        let text = raw
+            .get("choices")?
+            .get(0)?
+            .get("message")?
+            .get("reasoning")?
+            .as_str()?;
+        if text.is_empty() { None } else { Some(text.to_string()) }
+    }
+
+    fn name(&self) -> &'static str {
+        "reasoning"
+    }
+}
+
 /// MiniMax-2.7 with `reasoning_split: true`: `choices[0].message.reasoning_details`
 pub struct ReasoningDetailsExtractor;
 
@@ -113,6 +132,7 @@ impl ReasoningChain {
     /// Create chain with all built-in extractors.
     pub fn default_chain() -> Self {
         let mut chain = Self { extractors: Vec::new() };
+        chain.register(ReasoningFieldExtractor);
         chain.register(ReasoningContentExtractor);
         chain.register(ReasoningDetailsExtractor);
         chain.register(ThinkTagExtractor);

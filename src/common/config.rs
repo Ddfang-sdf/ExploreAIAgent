@@ -97,7 +97,13 @@ pub struct LlmConfig {
     /// Model max output tokens. If not set, defaults to 8192.
     #[serde(default)]
     pub max_output_tokens: Option<usize>,
+
+    /// API protocol: "openai" (default) or "anthropic".
+    #[serde(default = "default_api_protocol")]
+    pub api_protocol: String,
 }
+
+fn default_api_protocol() -> String { "openai".to_string() }
 
 impl Default for LlmConfig {
     fn default() -> Self {
@@ -110,6 +116,7 @@ impl Default for LlmConfig {
             thinking: default_thinking(),
             context_limit: None,
             max_output_tokens: None,
+            api_protocol: default_api_protocol(),
         }
     }
 }

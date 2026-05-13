@@ -1,13 +1,8 @@
-pub mod session;
-
 use serde::{Deserialize, Serialize};
 
 use crate::common::config::AppConfig;
-use crate::context::exploration::ExplorationContextTool;
 use crate::orchestrator::orchestrator::Orchestrator;
 use crate::conversation::manager::ConversationManager;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 // ============================================================================
 // Data structures (design doc section 3.5)
@@ -48,7 +43,6 @@ impl ChatResponse {
 pub struct AppState {
     pub orchestrator: Orchestrator,
     pub conversation_manager: ConversationManager,
-    pub sessions: Mutex<HashMap<String, Arc<ExplorationContextTool>>>,
     pub config: AppConfig,
 }
 
@@ -58,12 +52,7 @@ impl AppState {
         conversation_manager: ConversationManager,
         config: AppConfig,
     ) -> Self {
-        AppState {
-            orchestrator,
-            conversation_manager,
-            sessions: Mutex::new(HashMap::new()),
-            config,
-        }
+        AppState { orchestrator, conversation_manager, config }
     }
 }
 
@@ -85,16 +74,8 @@ pub async fn handle_chat_request(
         .session_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string());
 
-    // Step 3: get or create ExplorationContextTool for this session
-    let mut sessions = state.sessions.lock().unwrap();
-    let ect = sessions.entry(session_id.clone()).or_insert_with(|| {
-        let mut ect = ExplorationContextTool::new(session_id.clone());
-        ect.configure(&state.config.exploration, &state.config.context);
-        Arc::new(ect)
-    }).clone(); // clone Arc for this request, keep original in map
-
-    // Step 4: call Orchestrator
-    match state.orchestrator.run(&body.question, "", ect).await {
+    // call Orchestrator
+    match state.orchestrator.run(&body.question, "").await {
         Ok(answer) => ChatResponse {
             code: 0,
             session_id,

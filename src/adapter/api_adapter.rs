@@ -107,10 +107,10 @@ impl LlmStructuredClient for ApiAdapter {
                             serde_json::to_string(input_data).unwrap_or_default()
                         )
                     };
-                    let messages = vec![serde_json::json!({
-                        "role": "system",
-                        "content": prompt
-                    })];
+                    let messages = vec![
+                        serde_json::json!({"role": "system", "content": prompt}),
+                        serde_json::json!({"role": "user", "content": "Process the above instructions."}),
+                    ];
                     let rf = if output_schema.is_some() {
                         Some(serde_json::json!({"type": "json_object"}))
                     } else {

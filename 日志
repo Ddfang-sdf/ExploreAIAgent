@@ -1,0 +1,166 @@
+Explore AI Agent (CLI mode). 输入 /exit 或 exit 退出。
+>>> WSF是怎么校验SQL注入的？原理是什么？？给我代码。我应该怎么使用WSF来防止SQL注入？给我示例代码或者示例配置
+[compact] threshold=8000 tokens (source=default)
+[DEBUG:delta] keys=["content", "role"]
+[DEBUG:delta] content preview: 
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["content"]
+[DEBUG:delta] content preview: 
+
+
+
+
+  ⬩ search_content
+  ⚡ ok: search_content → {"matches":[{"content":"LOG.info(\"[WSF-Fuzz] Test HWEncoder
+  ⬩ search_files
+  ⚡ ok: search_files → {"files":[],"success":true,"truncated":false}
+  ⬩ search_files
+  ⚡ ok: search_files → {"files":[],"success":true,"truncated":false}
+[DEBUG:delta] keys=["content", "role"]
+[DEBUG:delta] content preview: 
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["content"]
+[DEBUG:delta] content preview: 
+
+
+
+
+  ⬩ read_file
+  ⚡ ok: read_file → {"content":"/*\n * Copyright (c) Huawei Technologies Co., Lt
+  ⬩ read_file
+  ⚡ ok: read_file → {"content":"/*\n * Copyright (c) Huawei Technologies Co., Lt
+[DEBUG:delta] keys=["content", "role"]
+[DEBUG:delta] content preview: 
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["reasoning"]
+[DEBUG:delta] keys=["content"]
+[DEBUG:delta] content preview: 
+
+
+
+
+  ⬩ search_content
+  ⚡ ok: search_content → {"matches":[],"success":true,"truncated":false}
+  ⬩ search_files
+  ⚡ ok: search_files → {"files":["WSFApplicationDemoForTest/src/main/resources/rule
+  ⬩ search_content
+  ⚡ ok: search_content → {"matches":[{"content":"String encodeForSQL = HWEncoder.enco

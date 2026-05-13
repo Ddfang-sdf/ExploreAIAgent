@@ -3,7 +3,6 @@ use tokio::sync::mpsc;
 use crate::adapter::api_adapter::{ApiAdapter, LlmStructuredClient, LlmToolClient};
 use crate::adapter::model::ModelAdapter;
 use crate::adapter::types::ToolDefinition;
-use crate::context::exploration::ExplorationContextTool;
 use crate::agents::conversation_compactor::ConversationCompactor;
 
 #[derive(Debug, Clone)]
@@ -59,7 +58,6 @@ impl MainAgent {
         dispatcher: &dyn ToolDispatcher,
         client: Arc<ApiAdapter>,
         model_adapter: &dyn ModelAdapter,
-        _exploration_context: Arc<ExplorationContextTool>,
         shell_only_mode: bool,
         compact_token_threshold: Option<usize>,
     ) -> Result<String, String> {
@@ -98,6 +96,7 @@ impl MainAgent {
         const SESSION_MAX_DELAY_API_ERROR_MS: u64 = 120_000;
 
         loop {
+            eprintln!("\r\x1b[K  \x1b[2m⏳ Thinking...\x1b[0m");
             let response = match client
                 .invoke_llm_streaming(&messages, &tools_json, None, |text| {
                     eprint!("\x1b[2m{}\x1b[0m", text);
@@ -105,7 +104,7 @@ impl MainAgent {
                 .await
             {
                 Ok((_raw, r)) => {
-                    eprintln!(); // separate thinking from tool output
+                    eprintln!();
                     r
                 }
                 Err(e) => {
@@ -123,22 +122,15 @@ impl MainAgent {
                     if is_non_retryable {
                         return Err(format!("Non-retryable LLM error: {}", e));
                     }
-
                     llm_error_count += 1;
                     let is_timeout = lower.contains("http timeout");
                     let max_delay_ms = if is_timeout { SESSION_MAX_DELAY_TIMEOUT_MS } else { SESSION_MAX_DELAY_API_ERROR_MS };
                     #[allow(clippy::cast_precision_loss)]
                     let delay_ms = ((SESSION_BASE_DELAY_MS as f64) * 2f64.powi(llm_error_count as i32 - 1)) as u64;
                     let delay = std::time::Duration::from_millis(delay_ms.min(max_delay_ms));
-
                     eprintln!("\r\x1b[K  \x1b[2m❌ LLM call failed (attempt {}): {}\x1b[0m", llm_error_count, e);
-                    messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": format!("LLM API 调用失败(429/超时): {}。请稍等后重试，或基于已有信息直接回答。", e),
-                    }));
-                    if shell_only_mode && messages.len() > 4 {
-                        compact_conversation(&mut messages, &mut recent_commands, client.as_ref() as &dyn LlmToolClient).await;
-                    }
+                    messages.push(serde_json::json!({"role": "user", "content": format!("LLM API 调用失败: {}。请稍等后重试。", e)}));
+                    if shell_only_mode && messages.len() > 4 { compact_conversation(&mut messages, &mut recent_commands, client.as_ref()).await; }
                     eprintln!("\r\x1b[K  \x1b[2m⏳ LLM error backoff {}ms (attempt {})...\x1b[0m", delay_ms.min(max_delay_ms), llm_error_count);
                     tokio::time::sleep(delay).await;
                     continue;
