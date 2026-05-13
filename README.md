@@ -4,12 +4,15 @@
 
 **核心**：MainAgent 通过 function-calling 调用 8 个工具探索代码库，SSE 流式输出思考过程，OpenCode 风格上下文精炼。
 
+**支持 OpenAI Chat Completions 和 Anthropic Messages 两种 API 协议**，一个 `api_protocol` 配置切换。
+
 ## 快速开始
 
 ### 环境要求
 
 - Rust 1.80+ （需 MSVC 工具链用于编译 C 模块）
-- LLM API Key（兼容 OpenAI 接口的任意厂商，支持 MiniMax / DeepSeek）
+- LLM API Key（支持 MiniMax / DeepSeek 等兼容模型）
+- 支持 OpenAI 和 Anthropic 两种 API 协议
 
 ### 安装
 
@@ -28,24 +31,32 @@ cp config.template.yaml config.yaml
 编辑 `config.yaml`：
 
 ```yaml
+# === OpenAI 协议（默认）===
 llm:
   api_key: "sk-your-key"
-  base_url: "https://api.minimaxi.com/v1"   # 或 https://api.deepseek.com/v1
-  model: "MiniMax-M2.7"                      # 或 deepseek-chat
-  thinking: true                             # MiniMax 思考模式
+  base_url: "https://api.minimaxi.com/v1"
+  model: "MiniMax-M2.7"
+  thinking: true
+
+# === 或 Anthropic 协议 ===
+# llm:
+#   api_key: "sk-your-key"
+#   base_url: "https://api.minimaxi.com/anthropic"
+#   model: "MiniMax-M2.7"
+#   api_protocol: "anthropic"
 
 exploration:
-  compact_token_threshold: 10000             # 压缩触发阈值
+  compact_token_threshold: 10000
 
 deep_explorer:
-  enable: true                               # 深度探索子代理
+  enable: true
   max_tool_calls: 75
 
 fast_explore:
-  enable: true                               # 快速关键词扫描
+  enable: true
 
 workspace:
-  path: "./workspace"                        # 待探索项目目录
+  path: "./workspace"
 ```
 
 ### 运行
@@ -98,7 +109,7 @@ MainAgent（决策中心，LLM function-calling 自主选择工具）
   基于探索数据生成最终答案
 ```
 
-**模型适配层**：`ModelAdapter` trait 屏蔽 OpenAI Chat / Anthropic Messages API 差异，支持 MiniMax / DeepSeek 等模型。
+**模型适配层**：`ModelAdapter` trait 统一 OpenAI / Anthropic 两种 API 协议。消息格式转换、工具调用、SSE 流式解析全部封装在适配层内，业务代码零感知。
 
 **思考过程**：SSE 流式解析 `reasoning_details` / `reasoning` / `reasoning_text` / `<think>` 标签，实时展示。
 
@@ -112,6 +123,7 @@ MainAgent（决策中心，LLM function-calling 自主选择工具）
 | `llm.base_url` | `https://api.deepseek.com/v1` | API 地址 |
 | `llm.model` | `deepseek-chat` | 模型名称 |
 | `llm.thinking` | `false` | MiniMax 思考模式 |
+| `llm.api_protocol` | `openai` | API 协议：`openai` 或 `anthropic` |
 | `exploration.compact_token_threshold` | `8000` | 压缩触发 token 数 |
 | `deep_explorer.enable` | `true` | 是否启用深度探索 |
 | `deep_explorer.max_tool_calls` | `75` | DE 最大工具调用次数 |
