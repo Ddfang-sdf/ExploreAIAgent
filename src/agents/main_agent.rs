@@ -1,8 +1,45 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::sync::mpsc;
 use crate::adapter::api_adapter::{ApiAdapter, LlmStructuredClient, LlmToolClient};
 use crate::adapter::model::ModelAdapter;
 use crate::adapter::types::ToolDefinition;
+
+/// Status bar: background spinner + label, updated via atomic state.
+/// State: 0=Idle, 1=Thinking, 2=ToolCalling, 3=Done
+struct StatusBar { state: Arc<AtomicU8> }
+
+impl StatusBar {
+    fn start() -> Self {
+        let state = Arc::new(AtomicU8::new(0));
+        let s = state.clone();
+        let frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+        tokio::spawn(async move {
+            let mut i = 0usize;
+            loop {
+                let st = s.load(Ordering::Relaxed);
+                if st == 3 { break; }
+                let (icon, label) = match st {
+                    1 => (frames[i % frames.len()], "Thinking\u{2026}"),
+                    2 => ("✻", "Tool calling\u{2026}"),
+                    _ => { i+=1; tokio::time::sleep(std::time::Duration::from_millis(100)).await; continue; }
+                };
+                eprint!("\r\x1b[K  \x1b[33m{}\x1b[0m  \x1b[2m{}\x1b[0m", icon, label);
+                i += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
+        StatusBar { state }
+    }
+    fn thinking(&self) { self.state.store(1, Ordering::Relaxed); }
+    fn tool_calling(&self) { self.state.store(2, Ordering::Relaxed); }
+    fn done(&self, elapsed: std::time::Duration) {
+        self.state.store(3, Ordering::Relaxed);
+        let secs = elapsed.as_secs_f64();
+        let label = if secs < 60.0 { format!("{:.0}s", secs) } else { format!("{}m {:.0}s", secs as u64 / 60, secs % 60.0) };
+        eprintln!("\r\x1b[K  \x1b[33m✻\x1b[0m  \x1b[2mWorked for {}\x1b[0m", label);
+    }
+}
 use crate::agents::conversation_compactor::ConversationCompactor;
 
 #[derive(Debug, Clone)]
@@ -90,13 +127,15 @@ impl MainAgent {
         let tools_json = model_adapter.format_tools(&tools);
 
         // OpenCode-style session retry: no hard cap, 2s base, double each attempt
+        let status = StatusBar::start();
+        let t0 = std::time::Instant::now();
         let mut llm_error_count: usize = 0;
         const SESSION_BASE_DELAY_MS: u64 = 2000;
         const SESSION_MAX_DELAY_TIMEOUT_MS: u64 = 30_000;
         const SESSION_MAX_DELAY_API_ERROR_MS: u64 = 120_000;
 
         loop {
-            eprintln!("\r\x1b[K  \x1b[2m⏳ Thinking...\x1b[0m");
+            status.thinking();
             let response = match client
                 .invoke_llm_streaming(&messages, &tools_json, None, |text| {
                     eprint!("\x1b[2m{}\x1b[0m", text);
@@ -120,6 +159,7 @@ impl MainAgent {
                         || lower.contains("bad request")
                         || lower.contains("chat content is empty");
                     if is_non_retryable {
+                        status.done(t0.elapsed());
                         return Err(format!("Non-retryable LLM error: {}", e));
                     }
                     llm_error_count += 1;
@@ -140,6 +180,7 @@ impl MainAgent {
             // If the LLM returned text without tool calls → final answer
             if let Some(text) = &response.text {
                 if response.tool_calls.is_empty() && !text.is_empty() {
+                    status.done(t0.elapsed());
                     return Ok(text.clone());
                 }
             }
@@ -152,7 +193,9 @@ impl MainAgent {
                 continue;
             }
 
-            // --- Tool calls: append assistant message, dispatch each tool, append results ---
+            // --- Tool calls ---
+            status.tool_calling();
+            // append assistant message, dispatch each tool, append results
             // Build assistant message from raw response (preserves model-specific fields)
             // We need the raw response for this, but call_llm_with_tools returns UnifiedResponse.
             // The raw response is not available here. For now, build a minimal assistant message.
