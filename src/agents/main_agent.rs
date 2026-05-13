@@ -131,8 +131,14 @@ impl MainAgent {
 
         loop {
             status.send(StatusState::Thinking);
+            let first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let f = first.clone();
             let response = match client
-                .invoke_llm_streaming(&messages, &tools_json, None, |text| {
+                .invoke_llm_streaming(&messages, &tools_json, None, move |text| {
+                    if f.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                        status.send(StatusState::Idle);
+                        eprint!("\n");
+                    }
                     eprint!("\x1b[2m{}\x1b[0m", text);
                 })
                 .await
