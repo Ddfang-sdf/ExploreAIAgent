@@ -1,44 +1,39 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::sync::mpsc;
 use crate::adapter::api_adapter::{ApiAdapter, LlmStructuredClient, LlmToolClient};
 use crate::adapter::model::ModelAdapter;
 use crate::adapter::types::ToolDefinition;
 
-/// Status bar: background spinner + label, updated via atomic state.
-/// State: 0=Idle, 1=Thinking, 2=ToolCalling, 3=Done
-struct StatusBar { state: Arc<AtomicU8> }
+/// Status bar: a background task renders animated spinner + label.
+/// Uses tokio::watch for pub/sub — business code publishes state, renderer subscribes.
+use tokio::sync::watch;
+#[derive(Clone, PartialEq)]
+enum StatusState { Idle, Thinking, ToolCalling, Done(String) }
+
+struct StatusBar { tx: watch::Sender<StatusState> }
 
 impl StatusBar {
     fn start() -> Self {
-        let state = Arc::new(AtomicU8::new(0));
-        let s = state.clone();
+        let (tx, mut rx) = watch::channel(StatusState::Idle);
         let frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
         tokio::spawn(async move {
             let mut i = 0usize;
             loop {
-                let st = s.load(Ordering::Relaxed);
-                if st == 3 { break; }
-                let (icon, label) = match st {
-                    1 => (frames[i % frames.len()], "Thinking\u{2026}"),
-                    2 => ("✻", "Tool calling\u{2026}"),
-                    _ => { i+=1; tokio::time::sleep(std::time::Duration::from_millis(100)).await; continue; }
+                rx.changed().await.ok(); // wait for state change or channel close
+                let st = rx.borrow().clone();
+                let label = match &st {
+                    StatusState::Thinking => format!("{} Thinking\u{2026}", frames[i % frames.len()]),
+                    StatusState::ToolCalling => "✻ Tool calling\u{2026}".to_string(),
+                    StatusState::Done(msg) => { eprintln!("\r\x1b[K  \x1b[33m✻\x1b[0m  \x1b[2m{}\x1b[0m", msg); break; }
+                    StatusState::Idle => { i+=1; continue; }
                 };
-                eprint!("\r\x1b[K  \x1b[33m{}\x1b[0m  \x1b[2m{}\x1b[0m", icon, label);
+                eprint!("\r\x1b[K  \x1b[33m{}\x1b[0m", label);
                 i += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         });
-        StatusBar { state }
+        StatusBar { tx }
     }
-    fn thinking(&self) { self.state.store(1, Ordering::Relaxed); }
-    fn tool_calling(&self) { self.state.store(2, Ordering::Relaxed); }
-    fn done(&self, elapsed: std::time::Duration) {
-        self.state.store(3, Ordering::Relaxed);
-        let secs = elapsed.as_secs_f64();
-        let label = if secs < 60.0 { format!("{:.0}s", secs) } else { format!("{}m {:.0}s", secs as u64 / 60, secs % 60.0) };
-        eprintln!("\r\x1b[K  \x1b[33m✻\x1b[0m  \x1b[2mWorked for {}\x1b[0m", label);
-    }
+    fn send(&self, st: StatusState) { let _ = self.tx.send(st); }
 }
 use crate::agents::conversation_compactor::ConversationCompactor;
 
@@ -135,7 +130,7 @@ impl MainAgent {
         const SESSION_MAX_DELAY_API_ERROR_MS: u64 = 120_000;
 
         loop {
-            status.thinking();
+            status.send(StatusState::Thinking);
             let response = match client
                 .invoke_llm_streaming(&messages, &tools_json, None, |text| {
                     eprint!("\x1b[2m{}\x1b[0m", text);
@@ -159,7 +154,7 @@ impl MainAgent {
                         || lower.contains("bad request")
                         || lower.contains("chat content is empty");
                     if is_non_retryable {
-                        status.done(t0.elapsed());
+                        { let s = t0.elapsed().as_secs_f64(); let label = if s < 60.0 { format!("{:.0}s", s) } else { format!("{}m {:.0}s", s as u64 / 60, s % 60.0) }; status.send(StatusState::Done(format!("Worked for {}", label))); };
                         return Err(format!("Non-retryable LLM error: {}", e));
                     }
                     llm_error_count += 1;
@@ -180,7 +175,7 @@ impl MainAgent {
             // If the LLM returned text without tool calls → final answer
             if let Some(text) = &response.text {
                 if response.tool_calls.is_empty() && !text.is_empty() {
-                    status.done(t0.elapsed());
+                    { let s = t0.elapsed().as_secs_f64(); let label = if s < 60.0 { format!("{:.0}s", s) } else { format!("{}m {:.0}s", s as u64 / 60, s % 60.0) }; status.send(StatusState::Done(format!("Worked for {}", label))); };
                     return Ok(text.clone());
                 }
             }
@@ -194,7 +189,7 @@ impl MainAgent {
             }
 
             // --- Tool calls ---
-            status.tool_calling();
+            status.send(StatusState::ToolCalling);
             // append assistant message, dispatch each tool, append results
             // Build assistant message from raw response (preserves model-specific fields)
             // We need the raw response for this, but call_llm_with_tools returns UnifiedResponse.
