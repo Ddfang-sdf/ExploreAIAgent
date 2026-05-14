@@ -63,6 +63,7 @@ impl ModelAdapter for OpenAiChatAdapter {
         messages: &[serde_json::Value],
         tools: &[serde_json::Value],
         response_format: Option<&serde_json::Value>,
+        extra_body: Option<&std::collections::HashMap<String, serde_json::Value>>,
     ) -> serde_json::Value {
         let mut body = serde_json::json!({
             "model": model,
@@ -82,6 +83,12 @@ impl ModelAdapter for OpenAiChatAdapter {
         }
         if let Some(rs) = self.reasoning_split {
             body["reasoning_split"] = serde_json::json!(rs);
+        }
+        // Provider-agnostic extra body — merged last, can override above
+        if let Some(eb) = extra_body {
+            for (k, v) in eb {
+                body[k] = v.clone();
+            }
         }
         body
     }
@@ -136,8 +143,8 @@ impl ModelAdapter for OpenAiChatAdapter {
 
     fn api_path(&self) -> &str { "/chat/completions" }
 
-    fn build_assistant_with_tools(&self, tool_calls: &[crate::adapter::types::ToolCallInfo]) -> serde_json::Value {
-        serde_json::json!({
+    fn build_assistant_with_tools(&self, tool_calls: &[crate::adapter::types::ToolCallInfo], reasoning: Option<&str>) -> serde_json::Value {
+        let mut msg = serde_json::json!({
             "role": "assistant",
             "content": "",
             "tool_calls": tool_calls.iter().map(|tc| serde_json::json!({
@@ -145,7 +152,11 @@ impl ModelAdapter for OpenAiChatAdapter {
                 "type": "function",
                 "function": {"name": tc.name, "arguments": serde_json::to_string(&tc.arguments).unwrap_or_default()}
             })).collect::<Vec<_>>()
-        })
+        });
+        if let Some(r) = reasoning {
+            msg["reasoning_content"] = serde_json::json!(r);
+        }
+        msg
     }
 
     fn build_tool_result(&self, tool_call_id: &str, content: &str) -> serde_json::Value {

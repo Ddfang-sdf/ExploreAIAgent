@@ -101,6 +101,11 @@ pub struct LlmConfig {
     /// API protocol: "openai" (default) or "anthropic".
     #[serde(default = "default_api_protocol")]
     pub api_protocol: String,
+
+    /// Provider-specific extra body fields merged directly into the request JSON.
+    /// e.g. `enable_thinking: false` for Bailian, `thinking: {type: enabled}` for MiniMax.
+    #[serde(default)]
+    pub extra_body: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 fn default_api_protocol() -> String { "openai".to_string() }
@@ -117,6 +122,7 @@ impl Default for LlmConfig {
             context_limit: None,
             max_output_tokens: None,
             api_protocol: default_api_protocol(),
+            extra_body: None,
         }
     }
 }

@@ -35,6 +35,7 @@ impl ModelAdapter for AnthropicMessagesAdapter {
         messages: &[serde_json::Value],
         tools: &[serde_json::Value],
         _response_format: Option<&serde_json::Value>,
+        extra_body: Option<&std::collections::HashMap<String, serde_json::Value>>,
     ) -> serde_json::Value {
         let mut system_text = String::new();
         let mut converted: Vec<serde_json::Value> = Vec::new();
@@ -112,6 +113,11 @@ impl ModelAdapter for AnthropicMessagesAdapter {
         if !tools.is_empty() {
             body["tools"] = serde_json::json!(tools);
         }
+        if let Some(eb) = extra_body {
+            for (k, v) in eb {
+                body[k] = v.clone();
+            }
+        }
         body
     }
 
@@ -163,7 +169,7 @@ impl ModelAdapter for AnthropicMessagesAdapter {
 
     fn api_path(&self) -> &str { "/v1/messages" }
 
-    fn build_assistant_with_tools(&self, tool_calls: &[crate::adapter::types::ToolCallInfo]) -> serde_json::Value {
+    fn build_assistant_with_tools(&self, tool_calls: &[crate::adapter::types::ToolCallInfo], _reasoning: Option<&str>) -> serde_json::Value {
         serde_json::json!({
             "role": "assistant",
             "content": tool_calls.iter().map(|tc| serde_json::json!({

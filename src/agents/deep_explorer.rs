@@ -287,7 +287,7 @@ impl DeepExplorer {
             }
 
             // Build assistant + tool messages via ModelAdapter (protocol-agnostic)
-            messages.push(model_adapter.build_assistant_with_tools(&response.tool_calls));
+            messages.push(model_adapter.build_assistant_with_tools(&response.tool_calls, response.reasoning.as_deref()));
 
             // Dispatch tool calls
             for tc in &response.tool_calls {

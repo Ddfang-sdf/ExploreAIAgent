@@ -40,6 +40,7 @@ pub struct ApiAdapter {
     pub(crate) api_key: String,
     pub(crate) model: String,
     pub(crate) thinking: bool,
+    pub(crate) extra_body: Option<std::collections::HashMap<String, serde_json::Value>>,
     pub(crate) model_adapter: Option<std::sync::Arc<dyn ModelAdapter>>,
 }
 
@@ -52,6 +53,7 @@ impl ApiAdapter {
             api_key: String::new(),
             model: String::new(),
             thinking: false,
+            extra_body: None,
             model_adapter: None,
         }
     }
@@ -68,6 +70,7 @@ impl ApiAdapter {
             api_key: config.api_key.clone(),
             model: config.model.clone(),
             thinking: config.thinking,
+            extra_body: config.extra_body.clone(),
             model_adapter: None,
         }
     }

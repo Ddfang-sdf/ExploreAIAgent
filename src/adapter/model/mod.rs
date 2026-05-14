@@ -15,13 +15,15 @@ pub trait ModelAdapter: Send + Sync {
     /// Convert ToolDefinitions to the API-native `tools` array format.
     fn format_tools(&self, tools: &[ToolDefinition]) -> Vec<serde_json::Value>;
 
-    /// Build the HTTP request body.
+    /// Build the HTTP request body. Provider-specific `extra_body` fields
+    /// are merged last so they can override any standard fields.
     fn build_request_body(
         &self,
         model: &str,
         messages: &[serde_json::Value],
         tools: &[serde_json::Value],
         response_format: Option<&serde_json::Value>,
+        extra_body: Option<&std::collections::HashMap<String, serde_json::Value>>,
     ) -> serde_json::Value;
 
     /// Parse raw API response into UnifiedResponse.
@@ -35,7 +37,7 @@ pub trait ModelAdapter: Send + Sync {
     fn api_path(&self) -> &str;
 
     /// Build an assistant message with tool calls in API-native format.
-    fn build_assistant_with_tools(&self, tool_calls: &[crate::adapter::types::ToolCallInfo]) -> serde_json::Value;
+    fn build_assistant_with_tools(&self, tool_calls: &[crate::adapter::types::ToolCallInfo], reasoning: Option<&str>) -> serde_json::Value;
 
     /// Build a tool result message in API-native format.
     fn build_tool_result(&self, tool_call_id: &str, content: &str) -> serde_json::Value;

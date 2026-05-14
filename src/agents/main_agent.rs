@@ -138,9 +138,30 @@ impl MainAgent {
             let think_buf = Arc::new(std::sync::Mutex::new(String::new()));
             let tb = think_buf.clone();
             let cf = cancel_flag.clone();
+            let status_for_stream = status.clone();
+            let stream_buf = Arc::new(std::sync::Mutex::new(String::new()));
+            let sb = stream_buf.clone();
             let llm_result = tokio::select! {
                 r = client.invoke_llm_streaming(&messages, &tools_json, None, move |text| {
                     tb.lock().unwrap().push_str(text);
+                    let mut buf = sb.lock().unwrap();
+                    buf.push_str(text);
+                    // Flush complete lines above spinner as deltas arrive
+                    while let Some(nl) = buf.find('\n') {
+                        let line = buf[..nl].trim().to_string();
+                        *buf = buf[nl+1..].to_string();
+                        if !line.is_empty() {
+                            status_for_stream.suspend(|| eprintln!("\x1b[2m{}\x1b[0m", line));
+                        }
+                    }
+                    // Flush long partial lines
+                    if buf.len() > 80 {
+                        let line = buf.trim().to_string();
+                        buf.clear();
+                        if !line.is_empty() {
+                            status_for_stream.suspend(|| eprintln!("\x1b[2m{}\x1b[0m", line));
+                        }
+                    }
                 }) => r,
                 _ = async {
                     loop {
@@ -152,16 +173,16 @@ impl MainAgent {
                     return Ok((String::new(), messages[2..].to_vec()));
                 }
             };
+            // Flush any remaining buffered thinking text
+            {
+                let remainder = stream_buf.lock().unwrap().trim().to_string();
+                if !remainder.is_empty() {
+                    status.suspend(|| eprintln!("\x1b[2m{}\x1b[0m", remainder));
+                }
+            }
             let response = match llm_result
             {
-                Ok((_raw, r)) => {
-                    let thinking = think_buf.lock().unwrap().clone();
-                    if !thinking.is_empty() {
-                        let preview: String = thinking.chars().take(200).collect();
-                        status.suspend(|| eprintln!("\x1b[2m{}\x1b[0m", preview));
-                    }
-                    r
-                }
+                Ok((_raw, r)) => r,
                 Err(e) => {
                     let lower = e.to_lowercase();
                     let is_non_retryable = lower.contains("llm api error (400)")
@@ -266,7 +287,7 @@ impl MainAgent {
                 }
             }
 
-            messages.push(serde_json::json!({
+            let mut asst_msg = serde_json::json!({
                 "role": "assistant",
                 "content": response.text.clone().unwrap_or_default(),
                 "tool_calls": response.tool_calls.iter().map(|tc| {
@@ -279,7 +300,11 @@ impl MainAgent {
                         }
                     })
                 }).collect::<Vec<_>>(),
-            }));
+            });
+            if let Some(ref r) = response.reasoning {
+                asst_msg["reasoning_content"] = serde_json::json!(r);
+            }
+            messages.push(asst_msg);
 
             for tc in &response.tool_calls {
                 if cancel_flag.load(Ordering::SeqCst) {
@@ -294,8 +319,8 @@ impl MainAgent {
                     Ok(result) => {
                         let result_str = serde_json::to_string(&result).unwrap_or_default();
                         let truncated = result.get("truncated").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let preview_short: String = result_str.chars().take(40).collect();
-                        status.suspend(|| eprintln!("  \x1b[2m✓ {} → {}\x1b[0m", tool_name, preview_short));
+                        let arg_hint = tool_arg_summary(tool_name, &tc.arguments);
+                        status.suspend(|| eprintln!("  \x1b[2m✓ {} — {}\x1b[0m", tool_name, arg_hint));
 
                         let mut content = result_str;
                         if truncated {
@@ -524,4 +549,33 @@ fn has_tool_calls_msg(msg: &serde_json::Value) -> bool {
         return arr.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
     }
     false
+}
+
+fn tool_arg_summary(tool_name: &str, args: &serde_json::Value) -> String {
+    let truncate = |s: &str, max: usize| -> String {
+        if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max]) }
+    };
+    let val = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    match tool_name {
+        "execute_shell" => truncate(val("command"), 70),
+        "fast_explore" => {
+            let kws: Vec<&str> = args.get("keywords")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            truncate(&kws.join(", "), 60)
+        }
+        "deep_explore" => truncate(val("question"), 60),
+        "search_content" => truncate(val("pattern"), 60),
+        "search_files" => truncate(val("pattern"), 60),
+        "read_file" => {
+            let file = val("file");
+            let lines = val("lines");
+            if lines.is_empty() { truncate(file, 60) }
+            else { truncate(&format!("{}:{}", file, lines), 60) }
+        }
+        "list_dir" => truncate(val("path"), 60),
+        "file_info" => truncate(val("file"), 60),
+        _ => String::new(),
+    }
 }
