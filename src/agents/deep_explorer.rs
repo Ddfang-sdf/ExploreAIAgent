@@ -216,31 +216,26 @@ impl DeepExplorer {
                 messages.push(serde_json::json!({"role": "user", "content": w}));
             }
 
-            // Token estimate for debug
+            // OpenCode-style compaction: truncate + compact when context gets large
             let total_chars: usize = messages.iter()
                 .map(|m| serde_json::to_string(m).unwrap_or_default().len())
                 .sum();
-            eprintln!("\r\x1b[K  \x1b[2mDE轮次{}: 消息数={} token≈{}\x1b[0m",
-                tool_call_count + 1, messages.len(), total_chars / 4);
-
-            // OpenCode-style compaction: truncate + compact when context gets large
             if total_chars / 4 > 8000 && messages.len() > 5 {
-                eprintln!("\r\x1b[K  \x1b[2m🗜️ DE压缩中...\x1b[0m");
+                eprintln!("\r\x1b[K  \x1b[2m🗜️ Deep Explorer 压缩中...\x1b[0m");
+                // Snapshot user_q before mutating messages — after split_off(),
+                // messages only contains the older portion so get(1) would be wrong.
+                let user_q = messages.get(1).cloned()
+                    .unwrap_or_else(|| serde_json::json!({"role": "user", "content": ""}));
                 let system = messages.remove(0);
                 let keep = 3usize.min(messages.len());
                 let mut split = messages.len().saturating_sub(keep);
-                // Don't split in the middle of an assistant/tool pair:
-                // If the first recent message is a tool result, push split back.
+                // Don't split in the middle of an assistant/tool pair.
+                // Check both OpenAI format (role="tool") and Anthropic format (role="user" with tool_result).
                 let original = split;
-                while split > 0 && messages[split].get("role").and_then(|r| r.as_str()) == Some("tool") {
+                while split > 0 && is_tool_result_msg(&messages[split]) {
                     split -= 1;
                 }
-                // If the last older message is an assistant with tool_calls,
-                // push split forward to include its tool results (but don't exceed original).
-                while split < original && split > 0
-                    && messages[split - 1].get("role").and_then(|r| r.as_str()) == Some("assistant")
-                    && messages[split - 1].get("tool_calls").is_some()
-                {
+                while split < original && split > 0 && has_tool_calls(&messages[split - 1]) {
                     split += 1;
                 }
                 let older: Vec<_> = messages[..split].to_vec();
@@ -253,8 +248,6 @@ impl DeepExplorer {
                     let qe: &dyn LlmToolClient = adapter;
                     match compactor.compact(&capped, previous_summary.as_deref(), qe).await {
                         Ok(summary) => {
-                            let user_q = messages.get(1).cloned()
-                                .unwrap_or_else(|| serde_json::json!({"role": "user", "content": ""}));
                             messages = vec![system, user_q];
                             messages.push(serde_json::json!({
                                 "role": "user",
@@ -262,7 +255,7 @@ impl DeepExplorer {
                             }));
                             messages.extend(recent);
                             previous_summary = Some(summary);
-                            eprintln!("\r\x1b[K  \x1b[2m🗜️ DE压缩完成\x1b[0m");
+                            eprintln!("\r\x1b[K  \x1b[2m🗜️ Deep Explorer 压缩完成\x1b[0m");
                         }
                         Err(e) => {
                             eprintln!("\r\x1b[K  \x1b[2m⚠ DE compact failed: {}\x1b[0m", e);
@@ -280,48 +273,25 @@ impl DeepExplorer {
             // Display reasoning
             if let Some(ref reason) = response.reasoning {
                 let preview: String = reason.lines().take(2).collect();
-                eprintln!("\r\x1b[K  \x1b[2m💭 DE: {}\x1b[0m", preview);
+                eprintln!("\r\x1b[K  \x1b[2mDeep Explorer: {}\x1b[0m", preview);
             }
 
-            // No tool calls → LLM is done exploring, extract result from text
+            // No tool calls → LLM is done exploring
             if response.tool_calls.is_empty() {
-                if let Some(text) = &response.text {
-                    if let Some(json) = extract_json_object(text) {
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json) {
-                            if let Some(result) = val.get("result") {
-                                if let Ok(r) = serde_json::from_value::<DeepExplorerResult>(result.clone()) {
-                                    eprintln!("\r\x1b[K  \x1b[2mDE完成：{} 次工具调用，耗时 {:.1}s\x1b[0m", tool_call_count, t0.elapsed().as_secs_f64());
-                                    return Ok(r);
-                                }
-                            }
-                        }
-                    }
-                }
-                // Fallback: ask for structured output
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": "请输出探索结果 JSON：{\"result\": {\"critical_files\": [...], \"collected_evidence\": [...], \"missing_info\": \"...\"}}"
-                }));
-                continue;
+                eprintln!("\r\x1b[K  \x1b[2mDeep Explorer 完成：{} 次工具调用，耗时 {:.1}s\x1b[0m", tool_call_count, t0.elapsed().as_secs_f64());
+                return Ok(DeepExplorerResult {
+                    critical_files: vec![],
+                    collected_evidence: vec![],
+                    missing_info: response.text.unwrap_or_default(),
+                });
             }
 
-            // Append assistant message
-            let assistant_msg = model_adapter.build_assistant_message(
-                &serde_json::json!({"choices": [{"message": {
-                    "role": "assistant",
-                    "content": response.text.clone().unwrap_or_default(),
-                    "tool_calls": response.tool_calls.iter().map(|tc| serde_json::json!({
-                        "id": tc.id.clone().unwrap_or_default(),
-                        "type": "function",
-                        "function": {"name": tc.name, "arguments": serde_json::to_string(&tc.arguments).unwrap_or_default()}
-                    })).collect::<Vec<_>>()
-                }}]})
-            ).unwrap_or_else(|_| serde_json::json!({"role": "assistant", "content": ""}));
-            messages.push(assistant_msg);
+            // Build assistant + tool messages via ModelAdapter (protocol-agnostic)
+            messages.push(model_adapter.build_assistant_with_tools(&response.tool_calls));
 
             // Dispatch tool calls
             for tc in &response.tool_calls {
-                eprintln!("\r\x1b[K  \x1b[2m⬩ DE: {}\x1b[0m", tc.name);
+                eprintln!("\r\x1b[K  \x1b[2m⬩ Deep Explorer: {}\x1b[0m", tc.name);
                 let params_str = serde_json::to_string(&tc.arguments).unwrap_or_default();
                 let _is_dup = self.check_duplicate(&tc.name, &params_str);
 
@@ -337,11 +307,9 @@ impl DeepExplorer {
                     result_str
                 };
 
-                messages.push(serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": tc.id.clone().unwrap_or_default(),
-                    "content": content,
-                }));
+                messages.push(model_adapter.build_tool_result(
+                    &tc.id.clone().unwrap_or_default(), &content,
+                ));
 
                 tool_call_count += 1;
             }
@@ -349,23 +317,24 @@ impl DeepExplorer {
     }
 }
 
-/// Extract the first complete JSON object from text using brace counting.
-fn extract_json_object(text: &str) -> Option<String> {
-    let start = text.find('{')?;
-    let bytes = text.as_bytes();
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (i, &b) in bytes.iter().enumerate().skip(start) {
-        if escaped { escaped = false; continue; }
-        if b == b'\\' && in_string { escaped = true; continue; }
-        if b == b'"' { in_string = !in_string; continue; }
-        if in_string { continue; }
-        if b == b'{' || b == b'[' { depth += 1; }
-        else if b == b'}' || b == b']' {
-            depth -= 1;
-            if depth == 0 { return Some(text[start..=i].to_string()); }
+fn is_tool_result_msg(msg: &serde_json::Value) -> bool {
+    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+    if role == "tool" { return true; }
+    if role == "user" {
+        if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+            return arr.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"));
         }
     }
-    None
+    false
 }
+
+fn has_tool_calls(msg: &serde_json::Value) -> bool {
+    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+    if role != "assistant" { return false; }
+    if msg.get("tool_calls").is_some() { return true; }
+    if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+        return arr.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
+    }
+    false
+}
+

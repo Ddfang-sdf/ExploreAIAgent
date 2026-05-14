@@ -10,11 +10,13 @@ pub struct ConversationOutput {
     pub conversation_summary: String,
     pub active_topic: String,
     pub recent_history: Vec<crate::context::conversation::ConversationRecord>,
+    pub previous_messages: Vec<serde_json::Value>,
 }
 
 #[derive(Clone)]
 pub struct ConversationManager {
     sessions: std::collections::HashMap<String, ConversationContextTool>,
+    previous_messages: std::collections::HashMap<String, Vec<serde_json::Value>>,
     _adapter: ApiAdapter,
 }
 
@@ -22,6 +24,7 @@ impl ConversationManager {
     pub fn new(adapter: ApiAdapter) -> Self {
         ConversationManager {
             sessions: std::collections::HashMap::new(),
+            previous_messages: std::collections::HashMap::new(),
             _adapter: adapter,
         }
     }
@@ -47,7 +50,6 @@ impl ConversationManager {
             .get_recent_history(RECENT_HISTORY_LIMIT)
             .to_vec();
 
-        // Extract active_topic from recent history (section 4.7)
         let active_topic = if let Some(last) = recent_history.last() {
             let answer = &last.answer_summary;
             let char_count = std::cmp::min(50, answer.chars().count());
@@ -56,10 +58,12 @@ impl ConversationManager {
             String::new()
         };
 
+        let previous_messages = self.previous_messages.get(session_id).cloned().unwrap_or_default();
         Ok(ConversationOutput {
             conversation_summary,
             active_topic,
             recent_history,
+            previous_messages,
         })
     }
 
@@ -68,6 +72,7 @@ impl ConversationManager {
         session_id: &str,
         question: &str,
         answer_summary: &str,
+        messages: Vec<serde_json::Value>,
     ) -> Result<(), String> {
         let session = self
             .sessions
@@ -75,6 +80,9 @@ impl ConversationManager {
             .ok_or_else(|| format!("Session not found: {}", session_id))?;
 
         session.add_record(question.to_string(), answer_summary.to_string());
+        if !messages.is_empty() {
+            self.previous_messages.insert(session_id.to_string(), messages);
+        }
         Ok(())
     }
 
@@ -95,7 +103,6 @@ impl ConversationManager {
             return Ok(());
         }
 
-        // Gather refinement input
         let (recent_history, existing_summary) = {
             let session = self
                 .sessions
@@ -117,13 +124,11 @@ impl ConversationManager {
             (recent, summary)
         };
 
-        // Call ConversationRefinerAgent
         let refiner = crate::agents::conversation_refiner::ConversationRefinerAgent::new();
         let refined = refiner
             .refine(current_question, &recent_history, &existing_summary, &self._adapter)
             .await?;
 
-        // Write back refined summary
         let session = self
             .sessions
             .get_mut(session_id)

@@ -16,6 +16,9 @@ uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 minreq = { version = "2", features = ["https-rustls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+indicatif = "0.18"
+crossterm = "0.28"
 clap = { version = "4", features = ["derive"] }
 axum = "0.7"
 tokio-stream = "0.1"

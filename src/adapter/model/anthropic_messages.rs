@@ -46,11 +46,16 @@ impl ModelAdapter for AnthropicMessagesAdapter {
                     system_text = format!("{}{}", system_text, msg.get("content").and_then(|c| c.as_str()).unwrap_or(""));
                 }
                 "user" => {
-                    let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    converted.push(serde_json::json!({
-                        "role": "user",
-                        "content": [{"type": "text", "text": content}]
-                    }));
+                    // If already Anthropic format (content is array of blocks), pass through
+                    if msg.get("content").and_then(|c| c.as_array()).is_some() {
+                        converted.push(msg.clone());
+                    } else {
+                        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                        converted.push(serde_json::json!({
+                            "role": "user",
+                            "content": [{"type": "text", "text": content}]
+                        }));
+                    }
                 }
                 "assistant" => {
                     // If already Anthropic format (content array), use as-is
@@ -157,4 +162,23 @@ impl ModelAdapter for AnthropicMessagesAdapter {
     }
 
     fn api_path(&self) -> &str { "/v1/messages" }
+
+    fn build_assistant_with_tools(&self, tool_calls: &[crate::adapter::types::ToolCallInfo]) -> serde_json::Value {
+        serde_json::json!({
+            "role": "assistant",
+            "content": tool_calls.iter().map(|tc| serde_json::json!({
+                "type": "tool_use",
+                "id": tc.id.clone().unwrap_or_default(),
+                "name": tc.name,
+                "input": tc.arguments,
+            })).collect::<Vec<_>>()
+        })
+    }
+
+    fn build_tool_result(&self, tool_call_id: &str, content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tool_call_id, "content": content}]
+        })
+    }
 }

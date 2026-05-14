@@ -7,5 +7,6 @@ pub mod adapter;
 pub mod orchestrator;
 pub mod conversation;
 pub mod cli;
+pub mod terminal;
 pub mod fast_explorer;
 pub mod web;

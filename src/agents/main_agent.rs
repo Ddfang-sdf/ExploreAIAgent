@@ -1,41 +1,43 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use crate::adapter::api_adapter::{ApiAdapter, LlmStructuredClient, LlmToolClient};
 use crate::adapter::model::ModelAdapter;
 use crate::adapter::types::ToolDefinition;
+use indicatif::{ProgressBar, ProgressStyle};
+use crate::agents::conversation_compactor::ConversationCompactor;
 
-/// Status bar: a background task renders animated spinner + label.
-/// Uses tokio::watch for pub/sub — business code publishes state, renderer subscribes.
-use tokio::sync::watch;
-#[derive(Clone, PartialEq)]
-enum StatusState { Idle, Thinking, ToolCalling, Done(String) }
-
-struct StatusBar { tx: watch::Sender<StatusState> }
+/// Status bar using indicatif spinner. Thinking text flows into the spinner message,
+/// tool output uses suspend() to print above.
+#[derive(Clone)]
+struct StatusBar { pb: ProgressBar }
 
 impl StatusBar {
     fn start() -> Self {
-        let (tx, mut rx) = watch::channel(StatusState::Idle);
-        let frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
-        tokio::spawn(async move {
-            let mut i = 0usize;
-            loop {
-                rx.changed().await.ok(); // wait for state change or channel close
-                let st = rx.borrow().clone();
-                let label = match &st {
-                    StatusState::Thinking => format!("{} Thinking\u{2026}", frames[i % frames.len()]),
-                    StatusState::ToolCalling => "✻ Tool calling\u{2026}".to_string(),
-                    StatusState::Done(msg) => { eprintln!("\r\x1b[K  \x1b[33m✻\x1b[0m  \x1b[2m{}\x1b[0m", msg); break; }
-                    StatusState::Idle => { i+=1; continue; }
-                };
-                eprint!("\r\x1b[K  \x1b[33m{}\x1b[0m", label);
-                i += 1;
-            }
-        });
-        StatusBar { tx }
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(ProgressStyle::with_template("{spinner} {msg}")
+            .unwrap()
+            .tick_strings(&[
+                "\x1b[38;2;215;119;87m·\x1b[39m",
+                "\x1b[38;2;215;119;87m✢\x1b[39m",
+                "\x1b[38;2;215;119;87m*\x1b[39m",
+                "\x1b[38;2;215;119;87m✶\x1b[39m",
+                "\x1b[38;2;215;119;87m✻\x1b[39m",
+                "\x1b[38;2;215;119;87m✽\x1b[39m",
+                "\x1b[38;2;215;119;87m✽\x1b[39m",
+                "\x1b[38;2;215;119;87m✻\x1b[39m",
+                "\x1b[38;2;215;119;87m✶\x1b[39m",
+                "\x1b[38;2;215;119;87m*\x1b[39m",
+                "\x1b[38;2;215;119;87m✢\x1b[39m",
+                "\x1b[38;2;215;119;87m·\x1b[39m",
+            ]));
+        pb.enable_steady_tick(std::time::Duration::from_millis(180));
+        StatusBar { pb }
     }
-    fn send(&self, st: StatusState) { let _ = self.tx.send(st); }
+    fn set_msg(&self, msg: impl Into<String>) { self.pb.set_message(msg.into()); }
+    fn finish(&self, msg: impl Into<String>) { self.pb.finish_with_message(msg.into()); }
+    fn suspend<F: FnOnce()>(&self, f: F) { self.pb.suspend(f); }
 }
-use crate::agents::conversation_compactor::ConversationCompactor;
 
 #[derive(Debug, Clone)]
 pub enum SseEvent { Thinking(String), Answer(String), Done }
@@ -85,14 +87,15 @@ impl MainAgent {
     pub async fn run(
         &self,
         question: &str,
-        conversation_context: &str,
+        previous_messages: &[serde_json::Value],
         tools: Vec<ToolDefinition>,
         dispatcher: &dyn ToolDispatcher,
         client: Arc<ApiAdapter>,
         model_adapter: &dyn ModelAdapter,
         shell_only_mode: bool,
         compact_token_threshold: Option<usize>,
-    ) -> Result<String, String> {
+        cancel_flag: Arc<AtomicBool>,
+    ) -> Result<(String, Vec<serde_json::Value>), String> {
         const DEFAULT_COMPACT_THRESHOLD: usize = 8000;
         let compact_usable: Option<usize> = if shell_only_mode {
             Some(compact_token_threshold.unwrap_or(DEFAULT_COMPACT_THRESHOLD))
@@ -108,16 +111,13 @@ impl MainAgent {
         const FALLBACK_COMPACT_ROUNDS: usize = 10;
 
         let system_prompt = Self::assemble_prompt();
-        let user_content = if conversation_context.is_empty() {
-            question.to_string()
-        } else {
-            format!("{}\n{}", conversation_context, question)
-        };
-
         let mut messages: Vec<serde_json::Value> = vec![
             serde_json::json!({"role": "system", "content": system_prompt}),
-            serde_json::json!({"role": "user", "content": user_content}),
+            serde_json::json!({"role": "user", "content": question}),
         ];
+        if !previous_messages.is_empty() {
+            messages.extend_from_slice(previous_messages);
+        }
 
         let tools_json = model_adapter.format_tools(&tools);
 
@@ -130,21 +130,36 @@ impl MainAgent {
         const SESSION_MAX_DELAY_API_ERROR_MS: u64 = 120_000;
 
         loop {
-            status.send(StatusState::Thinking);
-            let first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let f = first.clone();
-            let response = match client
-                .invoke_llm_streaming(&messages, &tools_json, None, move |text| {
-                    if f.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                        status.send(StatusState::Idle);
-                        eprint!("\n");
+            if cancel_flag.load(Ordering::SeqCst) {
+                status.finish("⏹ Interrupted");
+                return Ok((String::new(), messages[2..].to_vec()));
+            }
+            status.set_msg("Thinking\u{2026}");
+            let think_buf = Arc::new(std::sync::Mutex::new(String::new()));
+            let tb = think_buf.clone();
+            let cf = cancel_flag.clone();
+            let llm_result = tokio::select! {
+                r = client.invoke_llm_streaming(&messages, &tools_json, None, move |text| {
+                    tb.lock().unwrap().push_str(text);
+                }) => r,
+                _ = async {
+                    loop {
+                        if cf.load(Ordering::SeqCst) { break; }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
-                    eprint!("\x1b[2m{}\x1b[0m", text);
-                })
-                .await
+                } => {
+                    status.finish("⏹ Interrupted");
+                    return Ok((String::new(), messages[2..].to_vec()));
+                }
+            };
+            let response = match llm_result
             {
                 Ok((_raw, r)) => {
-                    eprintln!();
+                    let thinking = think_buf.lock().unwrap().clone();
+                    if !thinking.is_empty() {
+                        let preview: String = thinking.chars().take(200).collect();
+                        status.suspend(|| eprintln!("\x1b[2m{}\x1b[0m", preview));
+                    }
                     r
                 }
                 Err(e) => {
@@ -160,7 +175,7 @@ impl MainAgent {
                         || lower.contains("bad request")
                         || lower.contains("chat content is empty");
                     if is_non_retryable {
-                        { let s = t0.elapsed().as_secs_f64(); let label = if s < 60.0 { format!("{:.0}s", s) } else { format!("{}m {:.0}s", s as u64 / 60, s % 60.0) }; status.send(StatusState::Done(format!("Worked for {}", label))); };
+                        { let s = t0.elapsed().as_secs_f64(); let label = if s < 60.0 { format!("{:.0}s", s) } else { format!("{}m {:.0}s", s as u64 / 60, s % 60.0) }; status.finish(format!("✻ Worked for {}", label)); };
                         return Err(format!("Non-retryable LLM error: {}", e));
                     }
                     llm_error_count += 1;
@@ -178,11 +193,16 @@ impl MainAgent {
                 }
             };
 
+            if cancel_flag.load(Ordering::SeqCst) {
+                status.finish("⏹ Interrupted");
+                return Ok((String::new(), messages[2..].to_vec()));
+            }
+
             // If the LLM returned text without tool calls → final answer
             if let Some(text) = &response.text {
                 if response.tool_calls.is_empty() && !text.is_empty() {
-                    { let s = t0.elapsed().as_secs_f64(); let label = if s < 60.0 { format!("{:.0}s", s) } else { format!("{}m {:.0}s", s as u64 / 60, s % 60.0) }; status.send(StatusState::Done(format!("Worked for {}", label))); };
-                    return Ok(text.clone());
+                    { let s = t0.elapsed().as_secs_f64(); let label = if s < 60.0 { format!("{:.0}s", s) } else { format!("{}m {:.0}s", s as u64 / 60, s % 60.0) }; status.finish(format!("✻ Worked for {}", label)); };
+                    return Ok((text.clone(), messages[2..].to_vec()));
                 }
             }
             // If the LLM returned nothing useful → retry with guidance
@@ -195,34 +215,16 @@ impl MainAgent {
             }
 
             // --- Tool calls ---
-            status.send(StatusState::ToolCalling);
-            // append assistant message, dispatch each tool, append results
-            // Build assistant message from raw response (preserves model-specific fields)
-            // We need the raw response for this, but call_llm_with_tools returns UnifiedResponse.
-            // The raw response is not available here. For now, build a minimal assistant message.
-            // TODO: expose raw response from client to properly build assistant message.
-            messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": response.text.clone().unwrap_or_default(),
-                "tool_calls": response.tool_calls.iter().map(|tc| {
-                    serde_json::json!({
-                        "id": tc.id.clone().unwrap_or_default(),
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": serde_json::to_string(&tc.arguments).unwrap_or_default(),
-                        }
-                    })
-                }).collect::<Vec<_>>(),
-            }));
+            // Collect warnings first (before pushing assistant message) to avoid
+            // inserting user messages between assistant(tool_calls) and tool results,
+            // which breaks APIs that require tool results to immediately follow tool calls.
+            let mut pending_injects: Vec<serde_json::Value> = Vec::new();
 
             for tc in &response.tool_calls {
                 let tool_name = &tc.name;
-                eprintln!("\r\x1b[K  \x1b[2m⬩ {}\x1b[0m", tool_name);
-                sse_send(SseEvent::Thinking(tool_name.clone()));
+                let tool_key = format!("{}|{}", tool_name, serde_json::to_string(&tc.arguments).unwrap_or_default());
 
                 // Doom-loop detection
-                let tool_key = format!("{}|{}", tool_name, serde_json::to_string(&tc.arguments).unwrap_or_default());
                 if Some(tool_key.as_str()) == last_tool_key.as_deref() {
                     same_tool_streak += 1;
                 } else {
@@ -231,7 +233,7 @@ impl MainAgent {
                 }
                 if same_tool_streak >= DOOM_LOOP_THRESHOLD {
                     eprintln!("\r\x1b[K  \x1b[2m⟳ doom-loop warning ({}× same call)\x1b[0m", same_tool_streak);
-                    messages.push(serde_json::json!({
+                    pending_injects.push(serde_json::json!({
                         "role": "user",
                         "content": format!(
                             "注意：你已连续 {} 次调用相同工具相同参数。如果确实需要重复，请说明理由；否则请检查已有结果，尝试不同方向。",
@@ -252,7 +254,7 @@ impl MainAgent {
                         };
                         if !cat_target.is_empty() && catted_files.contains(&cat_target) {
                             eprintln!("\r\x1b[K  \x1b[2m⛔ repeat cat blocked: {}\x1b[0m", cat_target);
-                            messages.push(serde_json::json!({
+                            pending_injects.push(serde_json::json!({
                                 "role": "user",
                                 "content": format!("你已读取过 {}。如需更多内容，请用 sed -n '行范围p' 读取特定行；或用 grep -n 搜索关键词定位后再读。", cat_target),
                             }));
@@ -262,20 +264,38 @@ impl MainAgent {
                         }
                     }
                 }
+            }
+
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": response.text.clone().unwrap_or_default(),
+                "tool_calls": response.tool_calls.iter().map(|tc| {
+                    serde_json::json!({
+                        "id": tc.id.clone().unwrap_or_default(),
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                        }
+                    })
+                }).collect::<Vec<_>>(),
+            }));
+
+            for tc in &response.tool_calls {
+                if cancel_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                let tool_name = &tc.name;
+                status.set_msg(tool_name);
+                sse_send(SseEvent::Thinking(tool_name.clone()));
 
                 // Dispatch the tool
                 match dispatcher.dispatch(tool_name, &tc.arguments).await {
                     Ok(result) => {
                         let result_str = serde_json::to_string(&result).unwrap_or_default();
-                        let preview: String = result_str.chars().take(60).collect();
                         let truncated = result.get("truncated").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let display = if tool_name == "execute_shell" {
-                            let cmd = tc.arguments.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                            format!("{} {}", tool_name, cmd.chars().take(50).collect::<String>())
-                        } else {
-                            tool_name.to_string()
-                        };
-                        eprintln!("\r\x1b[K  \x1b[2m⚡ ok: {} → {}\x1b[0m", display, preview);
+                        let preview_short: String = result_str.chars().take(40).collect();
+                        status.suspend(|| eprintln!("  \x1b[2m✓ {} → {}\x1b[0m", tool_name, preview_short));
 
                         let mut content = result_str;
                         if truncated {
@@ -295,7 +315,7 @@ impl MainAgent {
                         }
                     }
                     Err(e) => {
-                        eprintln!("\r\x1b[K  \x1b[2m⚠ fail: {} | tool: {}\x1b[0m", e, tool_name);
+                        status.suspend(|| eprintln!("  \x1b[2m✗ {}: {}\x1b[0m", tool_name, e));
                         messages.push(serde_json::json!({
                             "role": "tool",
                             "tool_call_id": tc.id.clone().unwrap_or_default(),
@@ -317,6 +337,15 @@ impl MainAgent {
                         compact_conversation(&mut messages, &mut recent_commands, client.as_ref() as &dyn LlmToolClient).await;
                     }
                 }
+            }
+
+            // Push collected warnings AFTER all tool results so message ordering is:
+            // ... assistant(tool_calls) → tool → tool → ... → user(warnings)
+            messages.extend(pending_injects);
+
+            if cancel_flag.load(Ordering::SeqCst) {
+                status.finish("⏹ Interrupted");
+                return Ok((String::new(), messages[2..].to_vec()));
             }
         }
     }
@@ -397,19 +426,10 @@ async fn compact_conversation(
     eprintln!("\r\x1b[K  \x1b[2m🗜️ 对话压缩中...\x1b[0m");
     let keep_recent = 3usize.min(messages.len().saturating_sub(2));
     let mut split_at = messages.len().saturating_sub(keep_recent);
-    // Don't split in the middle of an assistant/tool pair.
-    // If the first recent message is a tool result, its assistant is in older → push split back.
-    while split_at > 2 && messages[split_at].get("role").and_then(|r| r.as_str()) == Some("tool") {
-        split_at -= 1;
-    }
-    // If the last older message is an assistant with tool_calls, ensure corresponding
-    // tool results stay with it by adjusting split forward.
-    while split_at < messages.len() && split_at > 2
-        && messages[split_at - 1].get("role").and_then(|r| r.as_str()) == Some("assistant")
-        && messages[split_at - 1].get("tool_calls").is_some()
-    {
-        split_at += 1;
-    }
+    // Don't split in the middle of an assistant/tool pair (both OpenAI and Anthropic format)
+    let original = split_at;
+    while split_at > 2 && is_tool_msg(&messages[split_at]) { split_at -= 1; }
+    while split_at < original && split_at > 2 && has_tool_calls_msg(&messages[split_at - 1]) { split_at += 1; }
     let before_tokens: usize = messages.iter()
         .map(|m| serde_json::to_string(m).unwrap_or_default().len() / 4)
         .sum();
@@ -483,4 +503,25 @@ fn has_usable_bash() -> bool {
     {
         std::path::Path::new("/bin/bash").exists()
     }
+}
+
+fn is_tool_msg(msg: &serde_json::Value) -> bool {
+    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+    if role == "tool" { return true; }
+    if role == "user" {
+        if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+            return arr.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"));
+        }
+    }
+    false
+}
+
+fn has_tool_calls_msg(msg: &serde_json::Value) -> bool {
+    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+    if role != "assistant" { return false; }
+    if msg.get("tool_calls").is_some() { return true; }
+    if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+        return arr.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
+    }
+    false
 }

@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
 use serde::{Deserialize, Serialize};
 
 use crate::common::config::AppConfig;
@@ -75,8 +78,8 @@ pub async fn handle_chat_request(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string());
 
     // call Orchestrator
-    match state.orchestrator.run(&body.question, "").await {
-        Ok(answer) => ChatResponse {
+    match state.orchestrator.run(&body.question, &[], Arc::new(AtomicBool::new(false))).await {
+        Ok((answer, _)) => ChatResponse {
             code: 0,
             session_id,
             answer: Some(answer),

@@ -234,62 +234,38 @@ impl ApiAdapter {
         let msg_count = messages.len();
         let est_tokens = body_str.len() / 4;
 
-        let timeout_dur = std::time::Duration::from_secs(60);
-        let result = tokio::time::timeout(
-            timeout_dur,
-            tokio::task::spawn_blocking(move || {
-                let response = minreq::post(&url)
-                    .with_header("Authorization", format!("Bearer {}", api_key))
-                    .with_header("Content-Type", "application/json")
-                    .with_body(body_str)
-                    .send()
-                    .map_err(|e| format!("HTTP request failed: {}", e))?;
+        let client = reqwest::Client::new();
+        let response = client.post(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .body(body_str)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed: {}", e))?;
 
-                let status = response.status_code;
-                let body_str = response.as_str()
-                    .map_err(|e| format!("Failed to read response body: {}", e))?;
-                let response_body: serde_json::Value = serde_json::from_str(body_str)
-                    .map_err(|e| format!("Failed to parse response: {}", e))?;
+        let status = response.status().as_u16();
+        let body_str = response.text().await
+            .map_err(|e| format!("Failed to read response body: {}", e))?;
+        let response_body: serde_json::Value = serde_json::from_str(&body_str)
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-                if status != 200 {
-                    // Diagnostic: dump ALL response headers on non-200
-                    let headers: Vec<String> = response.headers.iter()
-                        .map(|(k, v)| format!("  {}: {}", k, v))
-                        .collect();
-                    let body_preview: String = body_str.chars().take(300).collect();
-                    eprintln!("[HTTP {}] response headers:\n{}\n  body(preview): {}", status, headers.join("\n"), body_preview);
-                    // Parse retry-after header (OpenCode-style)
-                    let retry_after_ms = Self::parse_retry_after(&response);
-                    let error_msg = response_body
-                        .get("error")
-                        .and_then(|e| e.get("message"))
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("unknown error");
-                    let prefix = if let Some(ms) = retry_after_ms {
-                        format!("[retry_after={}] ", ms)
-                    } else {
-                        String::new()
-                    };
-                    return Err(format!("{}LLM API error ({}): {}", prefix, status, error_msg));
-                }
-
-                Ok(response_body)
-            })
-        ).await;
-
-        match result {
-            Ok(Ok(inner)) => inner,
-            Ok(Err(join_err)) => Err(format!("Task join error: {}", join_err)),
-            Err(_elapsed) => {
-                let purpose_label = if msg_count <= 1 { "compact" } else { "main" };
-                eprintln!("[WARN:{}] HTTP timeout after 60s ({} msgs, ~{} tok)", purpose_label, msg_count, est_tokens);
-                Err("HTTP timeout after 60s".to_string())
-            }
+        if status != 200 {
+            let body_preview: String = body_str.chars().take(300).collect();
+            eprintln!("[HTTP {}] body: {}", status, body_preview);
+            let error_msg = response_body
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("LLM API error ({}): {}", status, error_msg));
         }
+
+        let _ = (msg_count, est_tokens);
+        Ok(response_body)
     }
 
-    /// Streaming LLM call via SSE. Calls `on_reasoning` for each reasoning delta
-    /// as it arrives, then returns the accumulated (raw_json, UnifiedResponse).
+    /// Streaming LLM call via SSE (async, cancellable via future drop).
+    /// Calls `on_reasoning` for each reasoning delta, then returns (raw_json, UnifiedResponse).
     pub(crate) async fn invoke_llm_streaming(
         &self,
         messages: &[serde_json::Value],
@@ -321,236 +297,229 @@ impl ApiAdapter {
         let body_str = serde_json::to_string(&body)
             .map_err(|e| format!("Failed to serialize request body: {}", e))?;
 
-        let url_clone = url.clone();
-        let api_key_clone = api_key.clone();
-        let body_str_clone = body_str.clone();
+        let client = reqwest::Client::new();
+        let response = client.post(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .body(body_str)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed: {}", e))?;
 
-        let (raw_json, unified) = tokio::task::spawn_blocking(move || {
-            let response = minreq::post(&url_clone)
-                .with_header("Authorization", format!("Bearer {}", api_key_clone))
-                .with_header("Content-Type", "application/json")
-                .with_body(body_str_clone)
-                .send()
-                .map_err(|e| format!("HTTP request failed: {}", e))?;
+        let status = response.status().as_u16();
+        if status != 200 {
+            let preview = response.text().await.unwrap_or_default();
+            let preview: String = preview.chars().take(300).collect();
+            eprintln!("[HTTP {}] body: {}", status, preview);
+            return Err(format!("LLM API error ({}): {}", status, preview));
+        }
 
-            let status = response.status_code;
-            let body_str = response.as_str()
-                .map_err(|e| format!("Failed to read response body: {}", e))?;
-            if status != 200 {
-                let preview: String = body_str.chars().take(300).collect();
-                eprintln!("[HTTP {}] body: {}", status, preview);
-                return Err(format!("LLM API error ({}): {}", status, preview));
-            }
+        let body_str = response.text().await
+            .map_err(|e| format!("Failed to read response body: {}", e))?;
 
-            // Detect SSE format: OpenAI (choices[]) or Anthropic (content_block)
-            let is_anthropic = body_str.contains("\"content_block_start\"") || body_str.contains("\"content_block_delta\"");
+        // Detect SSE format: OpenAI (choices[]) or Anthropic (content_block)
+        let is_anthropic = body_str.contains("\"content_block_start\"") || body_str.contains("\"content_block_delta\"");
 
-            let mut full_content = String::new();
-            let mut tool_calls_map: std::collections::BTreeMap<i32, (String, String, String)> = std::collections::BTreeMap::new();
-            let mut reasoning_parts: Vec<String> = Vec::new();
-            let mut finish_reason: Option<String> = None;
+        let mut full_content = String::new();
+        let mut tool_calls_map: std::collections::BTreeMap<i32, (String, String, String)> = std::collections::BTreeMap::new();
+        let mut reasoning_parts: Vec<String> = Vec::new();
+        let mut finish_reason: Option<String> = None;
 
-            if is_anthropic {
-                // --- Anthropic SSE format ---
-                let mut current_event: Option<String> = None;
-                for line in body_str.lines() {
-                    let line = line.trim();
-                    if line.is_empty() { continue; }
-                    if line.starts_with("event: ") {
-                        current_event = Some(line[7..].to_string());
-                        continue;
+        if is_anthropic {
+            // --- Anthropic SSE format ---
+            let mut current_event: Option<String> = None;
+            for line in body_str.lines() {
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                if line.starts_with("event: ") {
+                    current_event = Some(line[7..].to_string());
+                    continue;
+                }
+                if !line.starts_with("data: ") { continue; }
+                let json_str = &line[6..];
+                let ev: serde_json::Value = serde_json::from_str(json_str)
+                    .map_err(|e| format!("SSE parse error: {} in: {}", e, &json_str[..200.min(json_str.len())]))?;
+
+                let ev_type = ev["type"].as_str().unwrap_or("");
+                match ev_type {
+                    "content_block_start" => {
+                        let cb = &ev["content_block"];
+                        let idx = ev["index"].as_i64().unwrap_or(0) as i32;
+                        match cb["type"].as_str().unwrap_or("") {
+                            "thinking" => {
+                                if let Some(t) = cb["thinking"].as_str() {
+                                    on_reasoning(t);
+                                    reasoning_parts.push(t.to_string());
+                                }
+                            }
+                            "tool_use" => {
+                                let id = cb["id"].as_str().unwrap_or("").to_string();
+                                let name = cb["name"].as_str().unwrap_or("").to_string();
+                                let input_str = cb["input"].as_object()
+                                    .filter(|o| !o.is_empty())
+                                    .map(|o| serde_json::to_string(o).unwrap_or_default())
+                                    .unwrap_or_default();
+                                tool_calls_map.entry(idx).or_insert_with(|| (id, name, input_str));
+                            }
+                            _ => {}
+                        }
                     }
-                    if !line.starts_with("data: ") { continue; }
-                    let json_str = &line[6..];
-                    let ev: serde_json::Value = serde_json::from_str(json_str)
-                        .map_err(|e| format!("SSE parse error: {} in: {}", e, &json_str[..200.min(json_str.len())]))?;
+                    "content_block_delta" => {
+                        let delta = &ev["delta"];
+                        let idx = ev["index"].as_i64().unwrap_or(0) as i32;
+                        match delta["type"].as_str().unwrap_or("") {
+                            "thinking_delta" => {
+                                if let Some(t) = delta["thinking"].as_str() {
+                                    on_reasoning(t);
+                                    reasoning_parts.push(t.to_string());
+                                }
+                            }
+                            "text_delta" => {
+                                if let Some(t) = delta["text"].as_str() {
+                                    full_content.push_str(t);
+                                }
+                            }
+                            "input_json_delta" => {
+                                if let Some(entry) = tool_calls_map.get_mut(&idx) {
+                                    if let Some(j) = delta["partial_json"].as_str() {
+                                        entry.2.push_str(j);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    "message_delta" => {
+                        if let Some(sr) = ev["delta"]["stop_reason"].as_str() {
+                            finish_reason = Some(sr.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            // --- OpenAI SSE format ---
+            for line in body_str.lines() {
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                if line == "data: [DONE]" { break; }
+                if !line.starts_with("data: ") { continue; }
 
-                    let ev_type = ev["type"].as_str().unwrap_or("");
-                    match ev_type {
-                        "content_block_start" => {
-                            let cb = &ev["content_block"];
-                            let idx = ev["index"].as_i64().unwrap_or(0) as i32;
-                            match cb["type"].as_str().unwrap_or("") {
-                                "thinking" => {
-                                    if let Some(t) = cb["thinking"].as_str() {
-                                        on_reasoning(t);
-                                        reasoning_parts.push(t.to_string());
-                                    }
-                                }
-                                "tool_use" => {
-                                    let id = cb["id"].as_str().unwrap_or("").to_string();
-                                    let name = cb["name"].as_str().unwrap_or("").to_string();
-                                    let input_str = cb["input"].as_object()
-                                        .filter(|o| !o.is_empty())
-                                        .map(|o| serde_json::to_string(o).unwrap_or_default())
-                                        .unwrap_or_default();
-                                    tool_calls_map.entry(idx).or_insert_with(|| (id, name, input_str));
-                                }
-                                _ => {}
+                let json_str = &line[6..];
+                let event: serde_json::Value = serde_json::from_str(json_str)
+                    .map_err(|e| format!("SSE JSON parse error: {} in: {}", e, &json_str[..200.min(json_str.len())]))?;
+
+                if let Some(fr) = event["choices"][0]["finish_reason"].as_str() {
+                    finish_reason = Some(fr.to_string());
+                }
+
+                let delta = &event["choices"][0]["delta"];
+
+                if let Some(rd) = delta["reasoning_details"].as_array() {
+                    for item in rd {
+                        if item["type"] == "reasoning.text" {
+                            if let Some(text) = item["text"].as_str() {
+                                on_reasoning(text);
+                                reasoning_parts.push(text.to_string());
                             }
                         }
-                        "content_block_delta" => {
-                            let delta = &ev["delta"];
-                            let idx = ev["index"].as_i64().unwrap_or(0) as i32;
-                            match delta["type"].as_str().unwrap_or("") {
-                                "thinking_delta" => {
-                                    if let Some(t) = delta["thinking"].as_str() {
-                                        on_reasoning(t);
-                                        reasoning_parts.push(t.to_string());
-                                    }
-                                }
-                                "text_delta" => {
-                                    if let Some(t) = delta["text"].as_str() {
-                                        full_content.push_str(t);
-                                    }
-                                }
-                                "input_json_delta" => {
-                                    if let Some(entry) = tool_calls_map.get_mut(&idx) {
-                                        if let Some(j) = delta["partial_json"].as_str() {
-                                            entry.2.push_str(j);
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        "message_delta" => {
-                            if let Some(sr) = ev["delta"]["stop_reason"].as_str() {
-                                finish_reason = Some(sr.to_string());
-                            }
-                        }
-                        _ => {}
                     }
                 }
-            } else {
-                // --- OpenAI SSE format ---
-                for line in body_str.lines() {
-                    let line = line.trim();
-                    if line.is_empty() { continue; }
-                    if line == "data: [DONE]" { break; }
-                    if !line.starts_with("data: ") { continue; }
-
-                    let json_str = &line[6..];
-                    let event: serde_json::Value = serde_json::from_str(json_str)
-                        .map_err(|e| format!("SSE JSON parse error: {} in: {}", e, &json_str[..200.min(json_str.len())]))?;
-
-                    if let Some(fr) = event["choices"][0]["finish_reason"].as_str() {
-                        finish_reason = Some(fr.to_string());
-                    }
-
-                    let delta = &event["choices"][0]["delta"];
-
-                    if let Some(rd) = delta["reasoning_details"].as_array() {
-                        for item in rd {
-                            if item["type"] == "reasoning.text" {
-                                if let Some(text) = item["text"].as_str() {
-                                    on_reasoning(text);
-                                    reasoning_parts.push(text.to_string());
-                                }
-                            }
+                for key in &["reasoning", "reasoning_text"] {
+                    if let Some(reason) = delta[*key].as_str() {
+                        if !reason.is_empty() {
+                            on_reasoning(reason);
+                            reasoning_parts.push(reason.to_string());
                         }
                     }
-                    for key in &["reasoning", "reasoning_text"] {
-                        if let Some(reason) = delta[*key].as_str() {
-                            if !reason.is_empty() {
-                                on_reasoning(reason);
-                                reasoning_parts.push(reason.to_string());
-                            }
-                        }
-                    }
-                    if let Some(content) = delta["content"].as_str() {
-                        if !content.is_empty() {
-                            let mut remaining = content;
-                            loop {
-                                if let Some(start) = remaining.find("<think>") {
-                                    if start > 0 { full_content.push_str(&remaining[..start]); }
-                                    let after_open = &remaining[start + 7..];
-                                    if let Some(end) = after_open.find("</think>") {
-                                        let think_text = &after_open[..end];
-                                        if !think_text.is_empty() {
-                                            on_reasoning(think_text);
-                                            reasoning_parts.push(think_text.to_string());
-                                        }
-                                        remaining = &after_open[end + 8..];
-                                    } else {
-                                        let think_text = after_open;
-                                        if !think_text.is_empty() {
-                                            on_reasoning(think_text);
-                                            reasoning_parts.push(think_text.to_string());
-                                        }
-                                        break;
+                }
+                if let Some(content) = delta["content"].as_str() {
+                    if !content.is_empty() {
+                        let mut remaining = content;
+                        loop {
+                            if let Some(start) = remaining.find("<think>") {
+                                if start > 0 { full_content.push_str(&remaining[..start]); }
+                                let after_open = &remaining[start + 7..];
+                                if let Some(end) = after_open.find("</think>") {
+                                    let think_text = &after_open[..end];
+                                    if !think_text.is_empty() {
+                                        on_reasoning(think_text);
+                                        reasoning_parts.push(think_text.to_string());
                                     }
+                                    remaining = &after_open[end + 8..];
                                 } else {
-                                    full_content.push_str(remaining);
+                                    let think_text = after_open;
+                                    if !think_text.is_empty() {
+                                        on_reasoning(think_text);
+                                        reasoning_parts.push(think_text.to_string());
+                                    }
                                     break;
                                 }
-                            }
-                        }
-                    }
-                    if let Some(tc_array) = delta["tool_calls"].as_array() {
-                        for tc in tc_array {
-                            let idx = tc["index"].as_i64().unwrap_or(0) as i32;
-                            let entry = tool_calls_map.entry(idx).or_insert_with(|| (String::new(), String::new(), String::new()));
-                            if let Some(id) = tc["id"].as_str() { entry.0 = id.to_string(); }
-                            if let Some(func) = tc.get("function") {
-                                if let Some(name) = func["name"].as_str() { entry.1 = name.to_string(); }
-                                if let Some(args) = func["arguments"].as_str() { entry.2.push_str(args); }
+                            } else {
+                                full_content.push_str(remaining);
+                                break;
                             }
                         }
                     }
                 }
-            }
-
-            // Build tool_calls from accumulated deltas
-            let mut tool_calls = Vec::new();
-            for (_idx, (id, name, args)) in tool_calls_map {
-                let arguments: serde_json::Value = if args.is_empty() {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::from_str(&args).unwrap_or(serde_json::Value::Null)
-                };
-                tool_calls.push(super::types::ToolCallInfo {
-                    id: Some(id),
-                    name,
-                    arguments,
-                });
-            }
-
-            let text = if full_content.is_empty() || full_content == "\n" {
-                None
-            } else {
-                Some(full_content)
-            };
-
-            let reasoning = if reasoning_parts.is_empty() { None } else { Some(reasoning_parts.join("")) };
-
-            // Build a synthetic raw response for build_assistant_message
-            let raw_json = serde_json::json!({
-                "choices": [{
-                    "finish_reason": finish_reason.unwrap_or_default(),
-                    "message": {
-                        "role": "assistant",
-                        "content": text.clone().unwrap_or_default(),
-                        "tool_calls": tool_calls.iter().map(|tc| {
-                            serde_json::json!({
-                                "id": tc.id.clone().unwrap_or_default(),
-                                "type": "function",
-                                "function": {
-                                    "name": tc.name,
-                                    "arguments": serde_json::to_string(&tc.arguments).unwrap_or_default(),
-                                }
-                            })
-                        }).collect::<Vec<_>>(),
+                if let Some(tc_array) = delta["tool_calls"].as_array() {
+                    for tc in tc_array {
+                        let idx = tc["index"].as_i64().unwrap_or(0) as i32;
+                        let entry = tool_calls_map.entry(idx).or_insert_with(|| (String::new(), String::new(), String::new()));
+                        if let Some(id) = tc["id"].as_str() { entry.0 = id.to_string(); }
+                        if let Some(func) = tc.get("function") {
+                            if let Some(name) = func["name"].as_str() { entry.1 = name.to_string(); }
+                            if let Some(args) = func["arguments"].as_str() { entry.2.push_str(args); }
+                        }
                     }
-                }]
+                }
+            }
+        }
+
+        // Build tool_calls from accumulated deltas
+        let mut tool_calls = Vec::new();
+        for (_idx, (id, name, args)) in tool_calls_map {
+            let arguments: serde_json::Value = if args.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_str(&args).unwrap_or(serde_json::Value::Null)
+            };
+            tool_calls.push(super::types::ToolCallInfo {
+                id: Some(id),
+                name,
+                arguments,
             });
+        }
 
-            let unified = super::types::UnifiedResponse { text, tool_calls, reasoning };
-            Ok::<(serde_json::Value, super::types::UnifiedResponse), String>((raw_json, unified))
-        }).await
-        .map_err(|e| format!("Task join error: {}", e))?
-        ?;
+        let text = if full_content.is_empty() || full_content == "\n" {
+            None
+        } else {
+            Some(full_content)
+        };
 
+        let reasoning = if reasoning_parts.is_empty() { None } else { Some(reasoning_parts.join("")) };
+
+        let raw_json = serde_json::json!({
+            "choices": [{
+                "finish_reason": finish_reason.unwrap_or_default(),
+                "message": {
+                    "role": "assistant",
+                    "content": text.clone().unwrap_or_default(),
+                    "tool_calls": tool_calls.iter().map(|tc| {
+                        serde_json::json!({
+                            "id": tc.id.clone().unwrap_or_default(),
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                            }
+                        })
+                    }).collect::<Vec<_>>(),
+                }
+            }]
+        });
+
+        let unified = super::types::UnifiedResponse { text, tool_calls, reasoning };
         Ok((raw_json, unified))
     }
 }

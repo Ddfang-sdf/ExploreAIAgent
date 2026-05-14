@@ -1,5 +1,6 @@
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use axum::{Router, routing::{get, post}, extract::State, Json, response::sse::{Event, Sse}};
 use tower_http::cors::{CorsLayer, Any};
@@ -63,8 +64,8 @@ async fn chat(
     let session_id = body.session_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string());
 
-    let resp = match state.core.orchestrator.run(&body.question, "").await {
-        Ok(answer) => ChatResponse {
+    let resp = match state.core.orchestrator.run(&body.question, &[], Arc::new(AtomicBool::new(false))).await {
+        Ok((answer, _)) => ChatResponse {
             code: 0, session_id, answer: Some(answer), error: None,
         },
         Err(e) => {
@@ -89,11 +90,11 @@ async fn chat_stream(
     let sid = session_id.clone();
 
     tokio::spawn(async move {
-        let result = core.orchestrator.run(&q, "").await;
+        let result = core.orchestrator.run(&q, &[], Arc::new(AtomicBool::new(false))).await;
         let tx_opt = main_agent::SSE_TX.lock().unwrap().clone();
         if let Some(tx) = tx_opt {
             match result {
-                Ok(answer) => {
+                Ok((answer, _)) => {
                     let _ = tx.send(SseEvent::Answer(answer));
                 }
                 Err(e) => {

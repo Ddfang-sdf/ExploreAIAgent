@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::adapter::api_adapter::{ApiAdapter, LlmStructuredClient};
 use crate::common::config::{DeepExplorerConfig, ExplorationConfig, FastExploreConfig};
@@ -75,8 +76,9 @@ impl Orchestrator {
     pub async fn run(
         &self,
         question: &str,
-        conversation_context: &str,
-    ) -> Result<String, String> {
+        previous_messages: &[serde_json::Value],
+        cancel_flag: Arc<AtomicBool>,
+    ) -> Result<(String, Vec<serde_json::Value>), String> {
         use crate::agents::main_agent::{DeepExploreExecutor, FastExploreExecutor, MainAgent};
         use crate::tools::fast_explore_tool::FastExploreTool;
         use std::sync::Arc;
@@ -176,6 +178,7 @@ impl Orchestrator {
                 }),
             });
         }
+
         if de_exec.is_some() {
             tools.push(ToolDefinition {
                 name: "deep_explore".into(),
@@ -257,6 +260,7 @@ impl Orchestrator {
             registry: &'a ToolRegistry,
             fe: Option<&'a (dyn FastExploreExecutor + 'a)>,
             de: Option<&'a (dyn DeepExploreExecutor + 'a)>,
+            cancel_flag: Arc<AtomicBool>,
         }
         #[async_trait::async_trait]
         impl ToolDispatcher for AgentDispatcher<'_> {
@@ -272,7 +276,16 @@ impl Orchestrator {
                                 .and_then(|k| k.as_array())
                                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                                 .unwrap_or_default();
-                            fe.execute(&keywords).await
+                            let cf = self.cancel_flag.clone();
+                            tokio::select! {
+                                r = fe.execute(&keywords) => r,
+                                _ = async {
+                                    loop {
+                                        if cf.load(Ordering::SeqCst) { break; }
+                                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                    }
+                                } => Err("Interrupted".to_string()),
+                            }
                         } else {
                             Err("fast_explore 未启用".into())
                         }
@@ -281,7 +294,16 @@ impl Orchestrator {
                         if let Some(de) = self.de {
                             let question = arguments.get("question").and_then(|q| q.as_str()).unwrap_or("");
                             let summary = arguments.get("current_summary");
-                            de.execute(question, summary).await
+                            let cf = self.cancel_flag.clone();
+                            tokio::select! {
+                                r = de.execute(question, summary) => r,
+                                _ = async {
+                                    loop {
+                                        if cf.load(Ordering::SeqCst) { break; }
+                                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                    }
+                                } => Err("Interrupted".to_string()),
+                            }
                         } else {
                             Err("deep_explore 未启用".into())
                         }
@@ -296,26 +318,29 @@ impl Orchestrator {
                 }
             }
         }
+
         let dispatcher = AgentDispatcher {
             shell: &shell_exec,
             registry: &self.tool_registry,
             fe: fe_exec,
             de: de_exec,
+            cancel_flag: cancel_flag.clone(),
         };
 
         let main_agent = MainAgent::new();
-        let answer = main_agent
+        let result = main_agent
             .run(
                 question,
-                conversation_context,
+                previous_messages,
                 tools,
                 &dispatcher,
                 self.adapter.clone(),
                 model_adapter.as_ref(),
                 shell_only,
                 self.compact_token_threshold,
+                cancel_flag,
             )
             .await?;
-        Ok(answer)
+        Ok(result)
     }
 }

@@ -135,4 +135,20 @@ impl ModelAdapter for OpenAiChatAdapter {
     }
 
     fn api_path(&self) -> &str { "/chat/completions" }
+
+    fn build_assistant_with_tools(&self, tool_calls: &[crate::adapter::types::ToolCallInfo]) -> serde_json::Value {
+        serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": tool_calls.iter().map(|tc| serde_json::json!({
+                "id": tc.id.clone().unwrap_or_default(),
+                "type": "function",
+                "function": {"name": tc.name, "arguments": serde_json::to_string(&tc.arguments).unwrap_or_default()}
+            })).collect::<Vec<_>>()
+        })
+    }
+
+    fn build_tool_result(&self, tool_call_id: &str, content: &str) -> serde_json::Value {
+        serde_json::json!({"role": "tool", "tool_call_id": tool_call_id, "content": content})
+    }
 }

@@ -33,6 +33,12 @@ pub trait ModelAdapter: Send + Sync {
 
     /// API endpoint path for this protocol (e.g. "/chat/completions", "/messages").
     fn api_path(&self) -> &str;
+
+    /// Build an assistant message with tool calls in API-native format.
+    fn build_assistant_with_tools(&self, tool_calls: &[crate::adapter::types::ToolCallInfo]) -> serde_json::Value;
+
+    /// Build a tool result message in API-native format.
+    fn build_tool_result(&self, tool_call_id: &str, content: &str) -> serde_json::Value;
 }
 
 pub use openai_chat::OpenAiChatAdapter;
